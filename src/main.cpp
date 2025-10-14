@@ -4,8 +4,8 @@
 #include <Wire.h>
 
 // Настройки точки доступа
-const char* ssid = "ESP32_TCP_Server";
-const char* password = "123456789"; // минимум 8 символов
+const char* ssid = "Robot_Controller";
+const char* password = "123456789";
 
 // Настройки TCP-сервера
 #define TCP_PORT 12345
@@ -15,13 +15,20 @@ WiFiClient tcpClient;
 // Переменные для управления
 bool ledState = false;
 unsigned long startTime = 0;
-unsigned long lastStatusTime = 0;
-const unsigned long STATUS_INTERVAL = 10000; // 10 секунд
+bool servosInitialized = false;
 
+// Объявление сервоприводов
 Servo servo[4][3];
 
-const int servo_pin[4][3] = { {2, 3, 4}, {5, 6, 7}, {8, 9, 10}, {11, 12, 13} };
+// Пины сервоприводов - проверьте правильность для ESP32
+const int servo_pin[4][3] = { 
+  {15, 2, 4},    // Нога 0
+  {5, 18, 19},    // Нога 1  
+  {21, 22, 23},   // Нога 2
+  {14, 12, 13}  // Нога 3
+};
 
+// Константы геометрии робота
 const float length_a = 84;
 const float length_b = 145;
 const float length_c = 72.5;
@@ -33,8 +40,9 @@ const float x_default = 124, x_offset = 0;
 const float y_start = 0, y_step = 80; 
 const float y_default = x_default;
 
-volatile float site_now[4][3];
-volatile float site_expect[4][3];
+// Переменные позиций
+float site_now[4][3];
+float site_expect[4][3];
 float temp_speed[4][3];
 float move_speed;
 float speed_multiple = 1;
@@ -42,11 +50,12 @@ const float spot_turn_speed = 5;
 const float leg_move_speed = 10; 
 const float body_move_speed = 4; 
 const float stand_seat_speed = 2; 
-volatile int rest_counter;
+int rest_counter = 0;
 
 const float KEEP = 255;
 const float pi = 3.1415926;
 
+// Предварительные вычисления
 const float temp_a = sqrt(pow(2 * x_default + length_side, 2) + pow(y_step, 2));
 const float temp_b = 2 * (y_start + y_step) + length_side;
 const float temp_c = sqrt(pow(2 * x_default + length_side, 2) + pow(2 * y_start + y_step + length_side, 2));
@@ -61,7 +70,7 @@ const float turn_y0 = temp_b * sin(temp_alpha) - turn_y1 - length_side;
 hw_timer_t *servo_timer = NULL;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Команды
+// Команды робота
 #define W_STAND        0
 #define W_SIT          1
 #define W_FORWARD      2
@@ -74,12 +83,12 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Прототипы функций
 void servo_service();
-void servo_attach(void);
+bool servo_attach(void);
 void servo_detach(void);
 void set_site(int leg, float x, float y, float z);
 void wait_reach(int leg);
 void wait_all_reach(void);
-void cartesian_to_polar(volatile float &alpha, volatile float &beta, volatile float &gamma, volatile float x, volatile float y, volatile float z);
+void cartesian_to_polar(float &alpha, float &beta, float &gamma, float x, float y, float z);
 void polar_to_servo(int leg, float alpha, float beta, float gamma);
 void sit(void);
 void stand(void);
@@ -98,15 +107,24 @@ void hand_shake(int i);
 void action_cmd(int action_mode);
 void do_test(void);
 
+// TCP функции
+void sendResponse(String message);
+void handleNewConnections();
+void sendSystemStatus();
+void processCommand(String command);
+void handleClientData();
+void blinkStatusLED();
+
 // Обработчик таймера для сервоприводов
 void IRAM_ATTR onTimer() {
   portENTER_CRITICAL_ISR(&timerMux);
-  servo_service();
+  if (servosInitialized) {
+    servo_service();
+  }
   portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 void setup() {
-  Wire.begin();
   Serial.begin(115200);
   delay(1000);
   
@@ -115,9 +133,49 @@ void setup() {
   digitalWrite(2, LOW);
   
   Serial.println();
-  Serial.println("🚀 Starting ESP32 as WiFi AP + TCP Server...");
+  Serial.println("🤖 Starting Robot TCP Controller...");
   
-  // Запуск точки доступа
+  // Инициализация переменных позиций
+  Serial.println("📐 Initializing robot positions...");
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      site_now[i][j] = 0;
+      site_expect[i][j] = 0;
+      temp_speed[i][j] = 0;
+    }
+  }
+
+  // Инициализация позиций
+  set_site(0, x_default - x_offset, y_start + y_step, z_boot);
+  set_site(1, x_default - x_offset, y_start + y_step, z_boot);
+  set_site(2, x_default + x_offset, y_start, z_boot);
+  set_site(3, x_default + x_offset, y_start, z_boot);
+  
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      site_now[i][j] = site_expect[i][j];
+    }
+  }
+
+  // Настройка таймера для сервоприводов (20ms период)
+  Serial.println("⏰ Setting up servo timer...");
+  servo_timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(servo_timer, &onTimer, true);
+  timerAlarmWrite(servo_timer, 20000, true);
+  timerAlarmEnable(servo_timer);
+
+  // Инициализация сервоприводов
+  Serial.println("🔧 Attaching servos...");
+  if (servo_attach()) {
+    servosInitialized = true;
+    Serial.println("✅ Servos initialized successfully");
+  } else {
+    Serial.println("❌ Servo initialization failed!");
+    servosInitialized = false;
+  }
+
+  // Настройка WiFi после инициализации сервоприводов
+  Serial.println("📡 Setting up WiFi...");
   WiFi.mode(WIFI_AP);
   
   // Конфигурация IP адреса
@@ -137,27 +195,60 @@ void setup() {
     return;
   }
   
-  delay(2000); // Даем время для инициализации
+  delay(2000);
   
   // Запуск TCP сервера
   tcpServer.begin();
   Serial.println("✅ TCP Server started");
   
   // Вывод информации о системе
-  Serial.println("\n=== SYSTEM INFORMATION ===");
+  Serial.println("\n=== ROBOT CONTROLLER ===");
   Serial.print("AP SSID:     ");
   Serial.println(ssid);
   Serial.print("AP IP:       ");
   Serial.println(WiFi.softAPIP());
-  Serial.print("AP MAC:      ");
-  Serial.println(WiFi.softAPmacAddress());
   Serial.print("TCP Port:    ");
   Serial.println(TCP_PORT);
-  Serial.print("Max Clients: ");
-  Serial.println(WiFi.softAPgetStationNum());
+  Serial.print("Servos:      ");
+  Serial.println(servosInitialized ? "READY" : "FAILED");
   Serial.println("==========================\n");
   
   startTime = millis();
+}
+
+bool servo_attach(void) {
+  Serial.println("🔌 Attaching servo motors...");
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      Serial.print("  Servo [");
+      Serial.print(i);
+      Serial.print("][");
+      Serial.print(j);
+      Serial.print("] on pin ");
+      Serial.print(servo_pin[i][j]);
+      Serial.print("... ");
+      
+      if (servo[i][j].attach(servo_pin[i][j])) {
+        Serial.println("OK");
+        delay(50); // Короткая задержка между инициализацией сервоприводов
+      } else {
+        Serial.println("FAILED");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void servo_detach(void) {
+  Serial.println("🔌 Detaching servo motors...");
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      servo[i][j].detach();
+      delay(50);
+    }
+  }
+  servosInitialized = false;
 }
 
 void sendResponse(String message) {
@@ -169,23 +260,27 @@ void sendResponse(String message) {
 void handleNewConnections() {
   if (tcpServer.hasClient()) {
     if (tcpClient.connected()) {
-      // Если клиент уже подключен, отказываем новому
       WiFiClient newClient = tcpServer.available();
       newClient.stop();
       Serial.println("⚠️  New connection rejected - client already connected");
     } else {
-      // Принимаем нового клиента
       tcpClient = tcpServer.available();
       Serial.println("✅ New TCP client connected!");
       
-      // Отправляем приветственное сообщение
-      String welcomeMsg = "Welcome to ESP32 TCP Server!\r\n";
+      String welcomeMsg = "🤖 Welcome to Robot TCP Controller!\r\n";
       welcomeMsg += "Available commands:\r\n";
-      welcomeMsg += "LED_ON    - Turn LED ON\r\n";
-      welcomeMsg += "LED_OFF   - Turn LED OFF\r\n";
-      welcomeMsg += "GET_TEMP  - Get temperature\r\n";
-      welcomeMsg += "GET_STATUS - System status\r\n";
-      welcomeMsg += "RESTART   - Restart ESP32\r\n";
+      welcomeMsg += "0 or STAND    - Stand up\r\n";
+      welcomeMsg += "1 or SIT      - Sit down\r\n";
+      welcomeMsg += "2 or FORWARD  - Step forward\r\n";
+      welcomeMsg += "3 or BACKWARD - Step backward\r\n";
+      welcomeMsg += "4 or LEFT     - Turn left\r\n";
+      welcomeMsg += "5 or RIGHT    - Turn right\r\n";
+      welcomeMsg += "6 or SHAKE    - Hand shake\r\n";
+      welcomeMsg += "7 or WAVE     - Hand wave\r\n";
+      welcomeMsg += "8 or DANCE    - Dance\r\n";
+      welcomeMsg += "TEST          - Run test sequence\r\n";
+      welcomeMsg += "STATUS        - System status\r\n";
+      welcomeMsg += "HELP          - Show this message\r\n";
       
       tcpClient.print(welcomeMsg);
     }
@@ -193,72 +288,118 @@ void handleNewConnections() {
 }
 
 void sendSystemStatus() {
-  String status = "=== SYSTEM STATUS ===\r\n";
+  String status = "=== ROBOT STATUS ===\r\n";
   status += "Uptime: " + String(millis() / 1000) + "s\r\n";
   status += "LED State: " + String(ledState ? "ON" : "OFF") + "\r\n";
   status += "Connected Clients: " + String(WiFi.softAPgetStationNum()) + "\r\n";
   status += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\r\n";
   status += "IP: " + WiFi.softAPIP().toString() + "\r\n";
+  status += "Servos: " + String(servosInitialized ? "READY" : "NOT READY") + "\r\n";
+  status += "Robot State: " + String(is_stand() ? "STANDING" : "SITTING") + "\r\n";
   status += "====================";
   
   sendResponse(status);
   Serial.println("📈 Sent system status");
 }
 
-void sendAutoStatus() {
-  if (tcpClient.connected() && millis() - lastStatusTime > STATUS_INTERVAL) {
-    String autoMsg = "[Auto] Uptime: " + String(millis() / 1000) + "s, Clients: " + String(WiFi.softAPgetStationNum());
-    tcpClient.println(autoMsg);
-    lastStatusTime = millis();
-    
-    Serial.println("🔄 Sent auto status");
-  }
-}
-
-
 void processCommand(String command) {
   command.toUpperCase();
+  command.trim();
   
-  if (command == "LED_ON" || command == "ON") {
+  Serial.print("📨 Processing command: ");
+  Serial.println(command);
+
+  if (!servosInitialized) {
+    sendResponse("❌ Servos not initialized! Cannot execute command.");
+    return;
+  }
+
+  // Обработка команд робота
+  if (command == "0" || command == "STAND") {
+    sendResponse("🤖 Standing up...");
+    stand();
+    sendResponse("✅ Robot is standing");
+  }
+  else if (command == "1" || command == "SIT") {
+    sendResponse("🤖 Sitting down...");
+    sit();
+    sendResponse("✅ Robot is sitting");
+  }
+  else if (command == "2" || command == "FORWARD") {
+    sendResponse("🤖 Moving forward...");
+    if (!is_stand()) stand();
+    step_forward(1);
+    sendResponse("✅ Step forward completed");
+  }
+  else if (command == "3" || command == "BACKWARD") {
+    sendResponse("🤖 Moving backward...");
+    if (!is_stand()) stand();
+    step_back(1);
+    sendResponse("✅ Step backward completed");
+  }
+  else if (command == "4" || command == "LEFT") {
+    sendResponse("🤖 Turning left...");
+    if (!is_stand()) stand();
+    turn_left(1);
+    sendResponse("✅ Turn left completed");
+  }
+  else if (command == "5" || command == "RIGHT") {
+    sendResponse("🤖 Turning right...");
+    if (!is_stand()) stand();
+    turn_right(1);
+    sendResponse("✅ Turn right completed");
+  }
+  else if (command == "6" || command == "SHAKE") {
+    sendResponse("🤖 Hand shaking...");
+    hand_shake(3);
+    sendResponse("✅ Hand shake completed");
+  }
+  else if (command == "7" || command == "WAVE") {
+    sendResponse("🤖 Hand waving...");
+    hand_wave(3);
+    sendResponse("✅ Hand wave completed");
+  }
+  else if (command == "8" || command == "DANCE") {
+    sendResponse("🤖 Dancing...");
+    body_dance(5);
+    sendResponse("✅ Dance completed");
+  }
+  else if (command == "TEST") {
+    sendResponse("🤖 Starting test sequence...");
+    do_test();
+    sendResponse("✅ Test sequence completed");
+  }
+  else if (command == "LED_ON" || command == "ON") {
     digitalWrite(2, HIGH);
     ledState = true;
-    sendResponse("LED turned ON");
-    Serial.println("💡 LED turned ON");
+    sendResponse("💡 LED turned ON");
   }
   else if (command == "LED_OFF" || command == "OFF") {
     digitalWrite(2, LOW);
     ledState = false;
-    sendResponse("LED turned OFF");
-    Serial.println("💡 LED turned OFF");
+    sendResponse("💡 LED turned OFF");
   }
-  else if (command == "GET_TEMP" || command == "TEMP") {
-    // Имитация данных с датчика температуры
-    float temperature = 25.0 + (random(0, 200) / 100.0); // 25.0 - 27.0
-    String response = "Temperature: " + String(temperature, 1) + " °C";
-    sendResponse(response);
-    Serial.println("📊 Sent temperature: " + String(temperature, 1) + " °C");
-  }
-  else if (command == "GET_STATUS" || command == "STATUS") {
+  else if (command == "STATUS") {
     sendSystemStatus();
-  }
-  else if (command == "RESTART" || command == "RESET") {
-    sendResponse("Restarting ESP32...");
-    delay(1000);
-    ESP.restart();
   }
   else if (command == "HELP" || command == "?") {
     String helpMsg = "Available commands:\r\n";
-    helpMsg += "LED_ON, LED_OFF - Control LED\r\n";
-    helpMsg += "GET_TEMP - Get temperature\r\n";
-    helpMsg += "GET_STATUS - System status\r\n";
-    helpMsg += "RESTART - Restart ESP32\r\n";
-    helpMsg += "HELP - This message\r\n";
+    helpMsg += "0, STAND    - Stand up\r\n";
+    helpMsg += "1, SIT      - Sit down\r\n";
+    helpMsg += "2, FORWARD  - Step forward\r\n";
+    helpMsg += "3, BACKWARD - Step backward\r\n";
+    helpMsg += "4, LEFT     - Turn left\r\n";
+    helpMsg += "5, RIGHT    - Turn right\r\n";
+    helpMsg += "6, SHAKE    - Hand shake\r\n";
+    helpMsg += "7, WAVE     - Hand wave\r\n";
+    helpMsg += "8, DANCE    - Dance\r\n";
+    helpMsg += "TEST        - Run test sequence\r\n";
+    helpMsg += "STATUS      - System status\r\n";
+    helpMsg += "HELP        - This message\r\n";
     sendResponse(helpMsg);
   }
   else {
-    // Эхо-ответ для неизвестных команд
-    String response = "Unknown command: " + command + "\r\nType HELP for available commands";
-    sendResponse(response);
+    sendResponse("❌ Unknown command: " + command + "\r\nType HELP for available commands");
   }
 }
 
@@ -271,7 +412,6 @@ void handleClientData() {
       Serial.print("📨 Received: ");
       Serial.println(message);
       
-      // Обработка команды
       processCommand(message);
     }
   }
@@ -290,45 +430,18 @@ void blinkStatusLED() {
   static unsigned long lastBlink = 0;
   static bool blinkState = false;
   
-  // Мигаем медленнее если есть подключенные клиенты
   unsigned long blinkInterval = tcpClient.connected() ? 1000 : 500;
   
   if (millis() - lastBlink > blinkInterval) {
     blinkState = !blinkState;
     
-    // Мигаем только если LED не включен командой
     if (!ledState) {
       digitalWrite(2, blinkState ? HIGH : LOW);
     }
     
     lastBlink = millis();
   }
-Serial.println("Robot starts initialization - ESP32 Version");
-
-// Инициализация позиций
-  set_site(0, x_default - x_offset, y_start + y_step, z_boot);
-  set_site(1, x_default - x_offset, y_start + y_step, z_boot);
-  set_site(2, x_default + x_offset, y_start, z_boot);
-  set_site(3, x_default + x_offset, y_start, z_boot);
-  
-  for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < 3; j++) {
-      site_now[i][j] = site_expect[i][j];
-    }
-  }
-
-  // Настройка таймера для сервоприводов (20ms период)
-  servo_timer = timerBegin(0, 80, true); // 80 MHz / 80 = 1 MHz
-  timerAttachInterrupt(servo_timer, &onTimer, true);
-  timerAlarmWrite(servo_timer, 20000, true); // 20ms
-  timerAlarmEnable(servo_timer);
-
-  servo_attach();
-  Serial.println("Servos initialized");
-  Serial.println("Robot initialization Complete");
-  Serial.println("Commands: 0-stand, 1-sit, 2-forward, 3-backward, 4-left, 5-right, 6-shake, 7-wave, 8-dance");
 }
-
 
 void loop() {
   // Обработка новых TCP подключений
@@ -337,31 +450,17 @@ void loop() {
   // Чтение данных от подключенного клиента
   handleClientData();
   
-  // Автоматическая отправка статуса
-  sendAutoStatus();
-  
   // Мигание LED для индикации работы
   blinkStatusLED();
   
   delay(10);
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    
-    if (input.length() > 0) {
-      int command = input.toInt();
-      if (command >= 0 && command <= 8) {
-        action_cmd(command);
-      } else {
-        Serial.println("Invalid command. Use 0-8");
-      }
-    }
-  }
-  
-  delay(10);
 }
 
+// ========== ФУНКЦИИ РОБОТА ==========
+
 void action_cmd(int action_mode) {
+  if (!servosInitialized) return;
+  
   int n_step = 1;
 
   switch (action_mode) {
@@ -412,49 +511,32 @@ void action_cmd(int action_mode) {
 }
 
 void do_test(void) {
+  if (!servosInitialized) return;
+  
   Serial.println("Stand");
   stand();
   delay(2000);
   Serial.println("Step forward");
-  step_forward(5);
+  step_forward(1);
   delay(2000);
   Serial.println("Step back");
-  step_back(5);
+  step_back(1);
   delay(2000);
   Serial.println("Turn left");
-  turn_left(5);
+  turn_left(1);
   delay(2000);
   Serial.println("Turn right");
-  turn_right(5);
+  turn_right(1);
   delay(2000);
   Serial.println("Hand wave");
-  hand_wave(3);
+  hand_wave(1);
   delay(2000);
   Serial.println("Hand shake");
-  hand_shake(3);
+  hand_shake(1);
   delay(2000);
   Serial.println("Sit");
   sit();
   delay(5000);
-}
-
-// Остальные функции остаются без изменений
-void servo_attach(void) {
-  for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < 3; j++) {
-      servo[i][j].attach(servo_pin[i][j]);
-      delay(100);
-    }
-  }
-}
-
-void servo_detach(void) {
-  for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < 3; j++) {
-      servo[i][j].detach();
-      delay(100);
-    }
-  }
 }
 
 bool is_stand(void) {
@@ -462,6 +544,8 @@ bool is_stand(void) {
 }
 
 void sit(void) {
+  if (!servosInitialized) return;
+  
   move_speed = stand_seat_speed;
   for (int leg = 0; leg < 4; leg++) {
     set_site(leg, KEEP, KEEP, z_boot);
@@ -470,6 +554,8 @@ void sit(void) {
 }
 
 void stand(void) {
+  if (!servosInitialized) return;
+  
   move_speed = stand_seat_speed;
   for (int leg = 0; leg < 4; leg++) {
     set_site(leg, KEEP, KEEP, z_default);
@@ -477,7 +563,9 @@ void stand(void) {
   wait_all_reach();
 }
 
+// Остальные функции робота остаются без изменений, но добавьте проверку servosInitialized в начале каждой
 void turn_left(unsigned int step) {
+  if (!servosInitialized) return;
   move_speed = spot_turn_speed;
   while (step-- > 0) {
     if (site_now[3][1] == y_start) {
@@ -547,6 +635,7 @@ void turn_left(unsigned int step) {
 }
 
 void turn_right(unsigned int step) {
+  if (!servosInitialized) return;
   move_speed = spot_turn_speed;
   while (step-- > 0) {
     if (site_now[2][1] == y_start) {
@@ -616,6 +705,7 @@ void turn_right(unsigned int step) {
 }
 
 void step_forward(unsigned int step) {
+  if (!servosInitialized) return;
   move_speed = leg_move_speed;
   while (step-- > 0) {
     if (site_now[2][1] == y_start) {
@@ -673,6 +763,7 @@ void step_forward(unsigned int step) {
 }
 
 void step_back(unsigned int step) {
+  if (!servosInitialized) return;
   move_speed = leg_move_speed;
   while (step-- > 0) {
     if (site_now[3][1] == y_start) {
@@ -730,6 +821,7 @@ void step_back(unsigned int step) {
 }
 
 void body_left(int i) {
+  if (!servosInitialized) return;
   set_site(0, site_now[0][0] + i, KEEP, KEEP);
   set_site(1, site_now[1][0] + i, KEEP, KEEP);
   set_site(2, site_now[2][0] - i, KEEP, KEEP);
@@ -738,6 +830,7 @@ void body_left(int i) {
 }
 
 void body_right(int i) {
+  if (!servosInitialized) return;
   set_site(0, site_now[0][0] - i, KEEP, KEEP);
   set_site(1, site_now[1][0] - i, KEEP, KEEP);
   set_site(2, site_now[2][0] + i, KEEP, KEEP);
@@ -746,6 +839,7 @@ void body_right(int i) {
 }
 
 void hand_wave(int i) {
+  if (!servosInitialized) return;
   float x_tmp;
   float y_tmp;
   float z_tmp;
@@ -786,7 +880,8 @@ void hand_wave(int i) {
 }
 
 void head_up(int i) {
-  set_site(0, KEEP, KEEP, site_now[0][2] - i);
+  if (!servosInitialized) return;
+ set_site(0, KEEP, KEEP, site_now[0][2] - i);
   set_site(1, KEEP, KEEP, site_now[1][2] + i);
   set_site(2, KEEP, KEEP, site_now[2][2] - i);
   set_site(3, KEEP, KEEP, site_now[3][2] + i);
@@ -794,6 +889,7 @@ void head_up(int i) {
 }
 
 void head_down(int i) {
+  if (!servosInitialized) return;
   set_site(0, KEEP, KEEP, site_now[0][2] + i);
   set_site(1, KEEP, KEEP, site_now[1][2] - i);
   set_site(2, KEEP, KEEP, site_now[2][2] + i);
@@ -802,6 +898,7 @@ void head_down(int i) {
 }
 
 void body_dance(int i) {
+  if (!servosInitialized) return;
   float x_tmp;
   float y_tmp;
   float z_tmp;
@@ -841,6 +938,7 @@ void body_dance(int i) {
 }
 
 void hand_shake(int i) {
+  if (!servosInitialized) return;
   float x_tmp;
   float y_tmp;
   float z_tmp;
@@ -881,6 +979,8 @@ void hand_shake(int i) {
 }
 
 void servo_service(void) {
+  if (!servosInitialized) return;
+  
   static float alpha, beta, gamma;
 
   for (int i = 0; i < 4; i++) {
@@ -933,7 +1033,7 @@ void wait_all_reach(void) {
   }
 }
 
-void cartesian_to_polar(volatile float &alpha, volatile float &beta, volatile float &gamma, volatile float x, volatile float y, volatile float z) {
+void cartesian_to_polar(float &alpha, float &beta, float &gamma, float x, float y, float z) {
   float v, w;
   w = (x >= 0 ? 1 : -1) * (sqrt(pow(x, 2) + pow(y, 2)));
   v = w - length_c;
@@ -947,6 +1047,8 @@ void cartesian_to_polar(volatile float &alpha, volatile float &beta, volatile fl
 }
 
 void polar_to_servo(int leg, float alpha, float beta, float gamma) {
+  if (!servosInitialized) return;
+  
   if (leg == 0) {
     alpha = 90 - alpha;
     beta = beta;
@@ -968,13 +1070,4 @@ void polar_to_servo(int leg, float alpha, float beta, float gamma) {
   servo[leg][0].write(alpha);
   servo[leg][1].write(beta);
   servo[leg][2].write(gamma);
-
-}
-
-// Функция для отправки broadcast сообщения всем клиентам
-void broadcastMessage(String message) {
-  // В этой реализации только один клиент, но можно расширить для нескольких
-  if (tcpClient.connected()) {
-    tcpClient.println("[Broadcast] " + message);
-  }
 }
