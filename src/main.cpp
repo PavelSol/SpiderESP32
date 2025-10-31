@@ -7,10 +7,15 @@
 const char* ssid = "Robot_Controller";
 const char* password = "123456789";
 
-// Настройки TCP-сервера
-#define TCP_PORT 12345
-WiFiServer tcpServer(TCP_PORT);
-WiFiClient tcpClient;
+// Настройки TCP-серверов
+#define COMMAND_TCP_PORT 12345    // Порт для команд
+#define SENSOR_TCP_PORT 12346     // Порт для данных с датчиков
+
+WiFiServer commandServer(COMMAND_TCP_PORT);  // Сервер для команд
+WiFiClient commandClient;                    // Клиент для команд
+
+WiFiServer sensorServer(SENSOR_TCP_PORT);    // Сервер для данных с датчиков
+WiFiClient sensorClient;                     // Клиент для данных с датчиков
 
 // Переменные для управления
 bool ledState = false;
@@ -27,6 +32,22 @@ const int servo_pin[4][3] = {
   {21, 22, 23},   // Нога 2
   {14, 12, 13}  // Нога 3
 };
+
+// Пины для датчиков
+#define MQ7_PIN 34     // Аналоговый пин для MQ-7
+#define MQ9_PIN 35     // Аналоговый пин для MQ-9
+#define TRIG_PIN 32    // Trig пин HC-SR04
+#define ECHO_PIN 33    // Echo пин HC-SR04
+
+// Переменные для датчиков
+int mq7Value = 0;
+int mq9Value = 0;
+float distance = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastAutoSend = 0;
+const unsigned long SENSOR_READ_INTERVAL = 1000; // Чтение датчиков каждую секунду
+const unsigned long AUTO_SEND_INTERVAL = 1000;   // Автоотправка каждую секунду
+bool autoSendEnabled = true; // Флаг автоматической отправки
 
 // Константы геометрии робота
 const float length_a = 84;
@@ -108,12 +129,20 @@ void action_cmd(int action_mode);
 void do_test(void);
 
 // TCP функции
-void sendResponse(String message);
+void sendCommandResponse(String message);
+void sendSensorData(String message);
 void handleNewConnections();
 void sendSystemStatus();
 void processCommand(String command);
 void handleClientData();
 void blinkStatusLED();
+
+// Функции для датчиков
+void setupSensors();
+void readSensors();
+void sendSensorDataToClient();
+float readDistance();
+void handleAutoSend();
 
 // Обработчик таймера для сервоприводов
 void IRAM_ATTR onTimer() {
@@ -134,6 +163,10 @@ void setup() {
   
   Serial.println();
   Serial.println("🤖 Starting Robot TCP Controller...");
+  
+  // Инициализация датчиков
+  Serial.println("🔌 Setting up sensors...");
+  setupSensors();
   
   // Инициализация переменных позиций
   Serial.println("📐 Initializing robot positions...");
@@ -197,9 +230,11 @@ void setup() {
   
   delay(2000);
   
-  // Запуск TCP сервера
-  tcpServer.begin();
-  Serial.println("✅ TCP Server started");
+  // Запуск TCP серверов
+  commandServer.begin();
+  sensorServer.begin();
+  Serial.println("✅ Command TCP Server started on port " + String(COMMAND_TCP_PORT));
+  Serial.println("✅ Sensor TCP Server started on port " + String(SENSOR_TCP_PORT));
   
   // Вывод информации о системе
   Serial.println("\n=== ROBOT CONTROLLER ===");
@@ -207,13 +242,99 @@ void setup() {
   Serial.println(ssid);
   Serial.print("AP IP:       ");
   Serial.println(WiFi.softAPIP());
-  Serial.print("TCP Port:    ");
-  Serial.println(TCP_PORT);
+  Serial.print("Command Port:");
+  Serial.println(COMMAND_TCP_PORT);
+  Serial.print("Sensor Port: ");
+  Serial.println(SENSOR_TCP_PORT);
   Serial.print("Servos:      ");
   Serial.println(servosInitialized ? "READY" : "FAILED");
+  Serial.println("Sensors:     MQ-7, MQ-9, HC-SR04");
+  Serial.println("Auto Send:   EVERY 1 SECOND to Sensor Port");
   Serial.println("==========================\n");
   
   startTime = millis();
+}
+
+void setupSensors() {
+  // Настройка пинов для ультразвукового датчика
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // MQ-7 и MQ-9 используют аналоговые пины, не требуют дополнительной настройки
+  Serial.println("✅ Sensors initialized: MQ-7, MQ-9, HC-SR04");
+}
+
+void readSensors() {
+  // Чтение значений с датчиков MQ-7 и MQ-9
+  mq7Value = analogRead(MQ7_PIN);
+  mq9Value = analogRead(MQ9_PIN);
+  
+  // Чтение расстояния с HC-SR04
+  distance = readDistance();
+}
+
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // Таймаут 30ms
+  float distance_cm = duration * 0.034 / 2;
+  
+  // Проверка на корректность значения
+  if (distance_cm <= 0 || distance_cm > 400) {
+    return -1.0; // Некорректное значение
+  }
+  
+  return distance_cm;
+}
+
+void sendSensorDataToClient() {
+  String sensorData = "SENSOR_DATA ";
+  sensorData += "MQ7:" + String(mq7Value) + ",";
+  sensorData += "MQ9:" + String(mq9Value) + ",";
+  sensorData += "DISTANCE:" + String(distance, 2);
+  
+  sendSensorData(sensorData);
+}
+
+void sendCommandResponse(String message) {
+  if (commandClient.connected()) {
+    commandClient.println(message);
+  }
+}
+
+void sendSensorData(String message) {
+  if (sensorClient.connected()) {
+    sensorClient.println(message);
+  }
+}
+
+void handleAutoSend() {
+  if (autoSendEnabled) {
+    unsigned long currentMillis = millis();
+    
+    if (currentMillis - lastSensorRead >= SENSOR_READ_INTERVAL) {
+      readSensors();
+      lastSensorRead = currentMillis;
+      
+      // Вывод в Serial для отладки
+      Serial.print("📊 Sensors - MQ7: ");
+      Serial.print(mq7Value);
+      Serial.print(" | MQ9: ");
+      Serial.print(mq9Value);
+      Serial.print(" | Distance: ");
+      Serial.print(distance);
+      Serial.println(" cm");
+    }
+    
+    if (currentMillis - lastAutoSend >= AUTO_SEND_INTERVAL) {
+      sendSensorDataToClient();
+      lastAutoSend = currentMillis;
+    }
+  }
 }
 
 bool servo_attach(void) {
@@ -251,23 +372,18 @@ void servo_detach(void) {
   servosInitialized = false;
 }
 
-void sendResponse(String message) {
-  if (tcpClient.connected()) {
-    tcpClient.println(message);
-  }
-}
-
 void handleNewConnections() {
-  if (tcpServer.hasClient()) {
-    if (tcpClient.connected()) {
-      WiFiClient newClient = tcpServer.available();
+  // Обработка новых подключений к командному серверу
+  if (commandServer.hasClient()) {
+    if (commandClient.connected()) {
+      WiFiClient newClient = commandServer.available();
       newClient.stop();
-      Serial.println("⚠️  New connection rejected - client already connected");
+      Serial.println("⚠️  New command connection rejected - client already connected");
     } else {
-      tcpClient = tcpServer.available();
-      Serial.println("✅ New TCP client connected!");
+      commandClient = commandServer.available();
+      Serial.println("✅ New Command TCP client connected!");
       
-      String welcomeMsg = "🤖 Welcome to Robot TCP Controller!\r\n";
+      String welcomeMsg = "🤖 Welcome to Robot Command Controller!\r\n";
       welcomeMsg += "Available commands:\r\n";
       welcomeMsg += "0 or STAND    - Stand up\r\n";
       welcomeMsg += "1 or SIT      - Sit down\r\n";
@@ -280,9 +396,38 @@ void handleNewConnections() {
       welcomeMsg += "8 or DANCE    - Dance\r\n";
       welcomeMsg += "TEST          - Run test sequence\r\n";
       welcomeMsg += "STATUS        - System status\r\n";
+      welcomeMsg += "SENSORS       - Get sensor data\r\n";
+      welcomeMsg += "AUTO_ON       - Enable auto send to sensor port\r\n";
+      welcomeMsg += "AUTO_OFF      - Disable auto send to sensor port\r\n";
       welcomeMsg += "HELP          - Show this message\r\n";
+      welcomeMsg += "---\r\n";
+      welcomeMsg += "📊 Sensor data is automatically sent to port " + String(SENSOR_TCP_PORT) + " every 1 second\r\n";
+      welcomeMsg += "Current auto send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED");
       
-      tcpClient.print(welcomeMsg);
+      commandClient.print(welcomeMsg);
+    }
+  }
+  
+  // Обработка новых подключений к серверу датчиков
+  if (sensorServer.hasClient()) {
+    if (sensorClient.connected()) {
+      WiFiClient newClient = sensorServer.available();
+      newClient.stop();
+      Serial.println("⚠️  New sensor connection rejected - client already connected");
+    } else {
+      sensorClient = sensorServer.available();
+      Serial.println("✅ New Sensor TCP client connected!");
+      
+      String sensorWelcomeMsg = "📊 Welcome to Robot Sensor Data Stream!\r\n";
+      sensorWelcomeMsg += "Sensor data will be sent automatically every 1 second\r\n";
+      sensorWelcomeMsg += "Format: SENSOR_DATA MQ7:value,MQ9:value,DISTANCE:value\r\n";
+      sensorWelcomeMsg += "Auto send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED") + "\r\n";
+      
+      sensorClient.print(sensorWelcomeMsg);
+      
+      // Отправляем текущие данные датчиков при подключении
+      readSensors();
+      sendSensorDataToClient();
     }
   }
 }
@@ -291,14 +436,19 @@ void sendSystemStatus() {
   String status = "=== ROBOT STATUS ===\r\n";
   status += "Uptime: " + String(millis() / 1000) + "s\r\n";
   status += "LED State: " + String(ledState ? "ON" : "OFF") + "\r\n";
-  status += "Connected Clients: " + String(WiFi.softAPgetStationNum()) + "\r\n";
+  status += "Command Clients: " + String(commandClient.connected() ? "1" : "0") + "\r\n";
+  status += "Sensor Clients: " + String(sensorClient.connected() ? "1" : "0") + "\r\n";
   status += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\r\n";
   status += "IP: " + WiFi.softAPIP().toString() + "\r\n";
+  status += "Command Port: " + String(COMMAND_TCP_PORT) + "\r\n";
+  status += "Sensor Port: " + String(SENSOR_TCP_PORT) + "\r\n";
   status += "Servos: " + String(servosInitialized ? "READY" : "NOT READY") + "\r\n";
   status += "Robot State: " + String(is_stand() ? "STANDING" : "SITTING") + "\r\n";
+  status += "Auto Send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED") + "\r\n";
+  status += "Sensors: MQ-7, MQ-9, HC-SR04\r\n";
   status += "====================";
   
-  sendResponse(status);
+  sendCommandResponse(status);
   Serial.println("📈 Sent system status");
 }
 
@@ -309,78 +459,110 @@ void processCommand(String command) {
   Serial.print("📨 Processing command: ");
   Serial.println(command);
 
-  if (!servosInitialized) {
-    sendResponse("❌ Servos not initialized! Cannot execute command.");
+  // Обновляем данные датчиков перед обработкой команды SENSORS
+  if (command == "SENSORS") {
+    readSensors();
+  }
+
+  if (!servosInitialized && !command.equals("SENSORS") && !command.equals("STATUS") && 
+      !command.equals("HELP") && !command.equals("AUTO_ON") && !command.equals("AUTO_OFF")) {
+    sendCommandResponse("❌ Servos not initialized! Cannot execute command.");
     return;
   }
 
   // Обработка команд робота
   if (command == "0" || command == "STAND") {
-    sendResponse("🤖 Standing up...");
+    sendCommandResponse("🤖 Standing up...");
     stand();
-    sendResponse("✅ Robot is standing");
+    sendCommandResponse("✅ Robot is standing");
   }
   else if (command == "1" || command == "SIT") {
-    sendResponse("🤖 Sitting down...");
+    sendCommandResponse("🤖 Sitting down...");
     sit();
-    sendResponse("✅ Robot is sitting");
+    sendCommandResponse("✅ Robot is sitting");
   }
   else if (command == "2" || command == "FORWARD") {
-    sendResponse("🤖 Moving forward...");
+    sendCommandResponse("🤖 Moving forward...");
     if (!is_stand()) stand();
     step_forward(1);
-    sendResponse("✅ Step forward completed");
+    sendCommandResponse("✅ Step forward completed");
   }
   else if (command == "3" || command == "BACKWARD") {
-    sendResponse("🤖 Moving backward...");
+    sendCommandResponse("🤖 Moving backward...");
     if (!is_stand()) stand();
     step_back(1);
-    sendResponse("✅ Step backward completed");
+    sendCommandResponse("✅ Step backward completed");
   }
   else if (command == "4" || command == "LEFT") {
-    sendResponse("🤖 Turning left...");
+    sendCommandResponse("🤖 Turning left...");
     if (!is_stand()) stand();
     turn_left(1);
-    sendResponse("✅ Turn left completed");
+    sendCommandResponse("✅ Turn left completed");
   }
   else if (command == "5" || command == "RIGHT") {
-    sendResponse("🤖 Turning right...");
+    sendCommandResponse("🤖 Turning right...");
     if (!is_stand()) stand();
     turn_right(1);
-    sendResponse("✅ Turn right completed");
+    sendCommandResponse("✅ Turn right completed");
   }
   else if (command == "6" || command == "SHAKE") {
-    sendResponse("🤖 Hand shaking...");
+    sendCommandResponse("🤖 Hand shaking...");
     hand_shake(3);
-    sendResponse("✅ Hand shake completed");
+    sendCommandResponse("✅ Hand shake completed");
   }
   else if (command == "7" || command == "WAVE") {
-    sendResponse("🤖 Hand waving...");
+    sendCommandResponse("🤖 Hand waving...");
     hand_wave(3);
-    sendResponse("✅ Hand wave completed");
+    sendCommandResponse("✅ Hand wave completed");
   }
   else if (command == "8" || command == "DANCE") {
-    sendResponse("🤖 Dancing...");
+    sendCommandResponse("🤖 Dancing...");
     body_dance(5);
-    sendResponse("✅ Dance completed");
+    sendCommandResponse("✅ Dance completed");
   }
   else if (command == "TEST") {
-    sendResponse("🤖 Starting test sequence...");
+    sendCommandResponse("🤖 Starting test sequence...");
     do_test();
-    sendResponse("✅ Test sequence completed");
+    sendCommandResponse("✅ Test sequence completed");
   }
   else if (command == "LED_ON" || command == "ON") {
     digitalWrite(2, HIGH);
     ledState = true;
-    sendResponse("💡 LED turned ON");
+    sendCommandResponse("💡 LED turned ON");
   }
   else if (command == "LED_OFF" || command == "OFF") {
     digitalWrite(2, LOW);
     ledState = false;
-    sendResponse("💡 LED turned OFF");
+    sendCommandResponse("💡 LED turned OFF");
   }
   else if (command == "STATUS") {
     sendSystemStatus();
+  }
+  else if (command == "SENSORS") {
+    sendCommandResponse("📊 Current sensor data - MQ7: " + String(mq7Value) + 
+                       ", MQ9: " + String(mq9Value) + 
+                       ", Distance: " + String(distance, 2) + " cm");
+    Serial.println("📊 Sent sensor data to command client");
+  }
+  else if (command == "AUTO_ON") {
+    autoSendEnabled = true;
+    sendCommandResponse("✅ Auto send ENABLED - sensor data will be sent to sensor port every second");
+    Serial.println("✅ Auto send enabled");
+    
+    // Уведомляем сенсорного клиента об изменении статуса
+    if (sensorClient.connected()) {
+      sensorClient.println("📊 Auto send: ENABLED");
+    }
+  }
+  else if (command == "AUTO_OFF") {
+    autoSendEnabled = false;
+    sendCommandResponse("✅ Auto send DISABLED - sensor data will not be sent automatically");
+    Serial.println("✅ Auto send disabled");
+    
+    // Уведомляем сенсорного клиента об изменении статуса
+    if (sensorClient.connected()) {
+      sensorClient.println("📊 Auto send: DISABLED");
+    }
   }
   else if (command == "HELP" || command == "?") {
     String helpMsg = "Available commands:\r\n";
@@ -395,34 +577,49 @@ void processCommand(String command) {
     helpMsg += "8, DANCE    - Dance\r\n";
     helpMsg += "TEST        - Run test sequence\r\n";
     helpMsg += "STATUS      - System status\r\n";
+    helpMsg += "SENSORS     - Get sensor data\r\n";
+    helpMsg += "AUTO_ON     - Enable auto send to sensor port\r\n";
+    helpMsg += "AUTO_OFF    - Disable auto send to sensor port\r\n";
     helpMsg += "HELP        - This message\r\n";
-    sendResponse(helpMsg);
+    helpMsg += "---\r\n";
+    helpMsg += "📊 Sensor data is automatically sent to port " + String(SENSOR_TCP_PORT) + " every 1 second when auto send is enabled";
+    sendCommandResponse(helpMsg);
   }
   else {
-    sendResponse("❌ Unknown command: " + command + "\r\nType HELP for available commands");
+    sendCommandResponse("❌ Unknown command: " + command + "\r\nType HELP for available commands");
   }
 }
 
 void handleClientData() {
-  if (tcpClient.connected() && tcpClient.available()) {
-    String message = tcpClient.readStringUntil('\n');
+  // Обработка данных от командного клиента
+  if (commandClient.connected() && commandClient.available()) {
+    String message = commandClient.readStringUntil('\n');
     message.trim();
     
     if (message.length() > 0) {
-      Serial.print("📨 Received: ");
+      Serial.print("📨 Received command: ");
       Serial.println(message);
       
       processCommand(message);
     }
   }
   
-  // Проверка разрыва соединения
-  static bool wasConnected = false;
-  if (wasConnected && !tcpClient.connected()) {
-    Serial.println("❌ TCP client disconnected");
-    wasConnected = false;
-  } else if (tcpClient.connected()) {
-    wasConnected = true;
+  // Проверка разрыва соединения для командного клиента
+  static bool commandWasConnected = false;
+  if (commandWasConnected && !commandClient.connected()) {
+    Serial.println("❌ Command TCP client disconnected");
+    commandWasConnected = false;
+  } else if (commandClient.connected()) {
+    commandWasConnected = true;
+  }
+  
+  // Проверка разрыва соединения для сенсорного клиента
+  static bool sensorWasConnected = false;
+  if (sensorWasConnected && !sensorClient.connected()) {
+    Serial.println("❌ Sensor TCP client disconnected");
+    sensorWasConnected = false;
+  } else if (sensorClient.connected()) {
+    sensorWasConnected = true;
   }
 }
 
@@ -430,7 +627,16 @@ void blinkStatusLED() {
   static unsigned long lastBlink = 0;
   static bool blinkState = false;
   
-  unsigned long blinkInterval = tcpClient.connected() ? 1000 : 500;
+  unsigned long blinkInterval;
+  
+  // Разная частота мигания в зависимости от состояния подключений
+  if (commandClient.connected() && sensorClient.connected()) {
+    blinkInterval = 300; // Быстрое мигание при двух подключениях
+  } else if (commandClient.connected() || sensorClient.connected()) {
+    blinkInterval = 600; // Средняя скорость при одном подключении
+  } else {
+    blinkInterval = 1200; // Медленное мигание без подключений
+  }
   
   if (millis() - lastBlink > blinkInterval) {
     blinkState = !blinkState;
@@ -447,8 +653,11 @@ void loop() {
   // Обработка новых TCP подключений
   handleNewConnections();
   
-  // Чтение данных от подключенного клиента
+  // Чтение данных от подключенных клиентов
   handleClientData();
+  
+  // Автоматическая отправка данных с датчиков на сенсорный порт
+  handleAutoSend();
   
   // Мигание LED для индикации работы
   blinkStatusLED();
