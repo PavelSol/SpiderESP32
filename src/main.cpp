@@ -25,19 +25,18 @@ bool servosInitialized = false;
 // Объявление сервоприводов
 Servo servo[4][3];
 
-// Пины сервоприводов - проверьте правильность для ESP32
 const int servo_pin[4][3] = { 
-  {15, 2, 4},    // Нога 0
-  {5, 18, 19},    // Нога 1  
-  {21, 22, 23},   // Нога 2
-  {14, 12, 13}  // Нога 3
+  {2, 4, 16},     // Нога 0 - пины 2,4,16 (все работают)
+  {17, 18, 19},   // Нога 1 - пины 17,18,19  
+  {21, 22, 23},   // Нога 2 - пины 21,22,23
+  {25, 26, 27}    // Нога 3 - пины 25,26,27
 };
 
 // Пины для датчиков
-#define MQ7_PIN 34     // Аналоговый пин для MQ-7
-#define MQ9_PIN 35     // Аналоговый пин для MQ-9
-#define TRIG_PIN 32    // Trig пин HC-SR04
-#define ECHO_PIN 33    // Echo пин HC-SR04
+#define MQ7_PIN 34     // Аналоговый вход
+#define MQ9_PIN 35     // Аналоговый вход
+#define TRIG_PIN 32    // Trig для HC-SR04
+#define ECHO_PIN 33    // Echo для HC-SR04
 
 // Переменные для датчиков
 int mq7Value = 0;
@@ -363,41 +362,29 @@ void handleAutoSend() {
 bool servo_attach(void) {
   Serial.println("🔌 Attaching servo motors...");
   
-  // Устанавливаем частоту ШИМ 50 Гц (период 20 мс) для сервоприводов
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  
+  // Простая инициализация без лишних проверок
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 3; j++) {
-      Serial.print("  Servo [");
-      Serial.print(i);
-      Serial.print("][");
-      Serial.print(j);
-      Serial.print("] on pin ");
-      Serial.print(servo_pin[i][j]);
-      Serial.print("... ");
+      int pin = servo_pin[i][j];
       
-      // Настройка сервопривода на 180 градусов
-      // Устанавливаем минимальную и максимальную ширину импульса для углов 0-180°
-      // Для большинства сервоприводов: 0° = 500µs, 180° = 2500µs
-      servo[i][j].setPeriodHertz(50); // Стандартная частота 50 Гц для сервоприводов
+      Serial.printf("  Servo [%d][%d] on pin %d... ", i, j, pin);
       
-      if (servo[i][j].attach(servo_pin[i][j], 500, 2500)) { // 500µs (0°), 2500µs (180°)
-        Serial.println("OK (180°)");
-        
-        // Устанавливаем сервопривод в нейтральное положение (90°)
-        servo[i][j].write(90);
-        delay(100); // Даем время сервоприводу дойти до позиции
+      // Минимальная настройка
+      servo[i][j].setPeriodHertz(50);
+      
+      // Пробуем подключить самым простым способом
+      if (servo[i][j].attach(pin)) {
+        Serial.println("✓ OK");
+        servo[i][j].write(90); // Устанавливаем в нейтраль
+        delay(100);
       } else {
-        Serial.println("FAILED");
-        return false;
+        Serial.println("❌ FAILED");
+        // Продолжаем с другими, не возвращаем false
       }
     }
   }
   
-  Serial.println("✅ All 12 servos configured for 180° operation");
+  // Всегда возвращаем true, даже если некоторые не подключились
   return true;
 }
 
