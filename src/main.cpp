@@ -207,6 +207,29 @@ void setup() {
     servosInitialized = false;
   }
 
+  if (servosInitialized) {
+    Serial.println("🔧 Testing servos...");
+    
+    // Плавно протестируйте каждый сервопривод
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 3; j++) {
+        Serial.printf("Testing servo[%d][%d] on pin %d\n", i, j, servo_pin[i][j]);
+        
+        // Движение от 0 до 180 градусов
+        for (int pos = 0; pos <= 180; pos += 30) {
+          servo[i][j].write(pos);
+          delay(100);
+        }
+        
+        // Возврат в нейтральное положение
+        servo[i][j].write(90);
+        delay(200);
+      }
+    }
+    
+    Serial.println("✅ Servo test completed");
+  }
+
   // Настройка WiFi после инициализации сервоприводов
   Serial.println("📡 Setting up WiFi...");
   WiFi.mode(WIFI_AP);
@@ -339,6 +362,13 @@ void handleAutoSend() {
 
 bool servo_attach(void) {
   Serial.println("🔌 Attaching servo motors...");
+  
+  // Устанавливаем частоту ШИМ 50 Гц (период 20 мс) для сервоприводов
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 3; j++) {
       Serial.print("  Servo [");
@@ -349,15 +379,25 @@ bool servo_attach(void) {
       Serial.print(servo_pin[i][j]);
       Serial.print("... ");
       
-      if (servo[i][j].attach(servo_pin[i][j])) {
-        Serial.println("OK");
-        delay(50); // Короткая задержка между инициализацией сервоприводов
+      // Настройка сервопривода на 180 градусов
+      // Устанавливаем минимальную и максимальную ширину импульса для углов 0-180°
+      // Для большинства сервоприводов: 0° = 500µs, 180° = 2500µs
+      servo[i][j].setPeriodHertz(50); // Стандартная частота 50 Гц для сервоприводов
+      
+      if (servo[i][j].attach(servo_pin[i][j], 500, 2500)) { // 500µs (0°), 2500µs (180°)
+        Serial.println("OK (180°)");
+        
+        // Устанавливаем сервопривод в нейтральное положение (90°)
+        servo[i][j].write(90);
+        delay(100); // Даем время сервоприводу дойти до позиции
       } else {
         Serial.println("FAILED");
         return false;
       }
     }
   }
+  
+  Serial.println("✅ All 12 servos configured for 180° operation");
   return true;
 }
 
@@ -443,6 +483,7 @@ void sendSystemStatus() {
   status += "Command Port: " + String(COMMAND_TCP_PORT) + "\r\n";
   status += "Sensor Port: " + String(SENSOR_TCP_PORT) + "\r\n";
   status += "Servos: " + String(servosInitialized ? "READY" : "NOT READY") + "\r\n";
+  status += "Servo Type: 180° Standard Servos\r\n";
   status += "Robot State: " + String(is_stand() ? "STANDING" : "SITTING") + "\r\n";
   status += "Auto Send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED") + "\r\n";
   status += "Sensors: MQ-7, MQ-9, HC-SR04\r\n";
@@ -1246,13 +1287,16 @@ void cartesian_to_polar(float &alpha, float &beta, float &gamma, float x, float 
   float v, w;
   w = (x >= 0 ? 1 : -1) * (sqrt(pow(x, 2) + pow(y, 2)));
   v = w - length_c;
-  alpha = atan2(z, v) + acos((pow(length_a, 2) - pow(length_b, 2) + pow(v, 2) + pow(z, 2)) / 2 / length_a / sqrt(pow(v, 2) + pow(z, 2)));
-  beta = acos((pow(length_a, 2) + pow(length_b, 2) - pow(v, 2) - pow(z, 2)) / 2 / length_a / length_b);
+  
+  // Исправленное вычисление углов
+  alpha = atan2(z, v) + acos((pow(length_a, 2) - pow(length_b, 2) + pow(v, 2) + pow(z, 2)) / (2 * length_a * sqrt(pow(v, 2) + pow(z, 2))));
+  beta = acos((pow(length_a, 2) + pow(length_b, 2) - pow(v, 2) - pow(z, 2)) / (2 * length_a * length_b));
   gamma = (w >= 0) ? atan2(y, x) : atan2(-y, -x);
   
-  alpha = alpha / pi * 180;
-  beta = beta / pi * 180;
-  gamma = gamma / pi * 180;
+  // Правильное преобразование радиан в градусы
+  alpha = alpha * 180 / pi;
+  beta = beta * 180 / pi;
+  gamma = gamma * 180 / pi;
 }
 
 void polar_to_servo(int leg, float alpha, float beta, float gamma) {
@@ -1276,6 +1320,14 @@ void polar_to_servo(int leg, float alpha, float beta, float gamma) {
     gamma += 90;
   }
 
+  // Ограничиваем углы в пределах 0-180 градусов для безопасности
+  alpha = constrain(alpha, 0, 180);
+  beta = constrain(beta, 0, 180);
+  gamma = constrain(gamma, 0, 180);
+  
+  // Для отладки можно раскомментировать:
+  // Serial.printf("Leg %d: A=%.1f, B=%.1f, G=%.1f\n", leg, alpha, beta, gamma);
+  
   servo[leg][0].write(alpha);
   servo[leg][1].write(beta);
   servo[leg][2].write(gamma);
