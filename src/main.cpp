@@ -3,6 +3,23 @@
 #include <ESP32Servo.h>
 #include <Wire.h>
 
+unsigned long lastServoUpdate = 0;
+const unsigned long SERVO_UPDATE_INTERVAL = 20; // 20ms = 50Hz
+
+#undef CONFIG_ARDUINO_LOOP_STACK_SIZE
+#define CONFIG_ARDUINO_LOOP_STACK_SIZE 16384
+
+// Добавьте эту функцию
+void stack_diagnostic() {
+  static unsigned long last_check = 0;
+  if (millis() - last_check > 10000) {
+    last_check = millis();
+    Serial.printf("Free heap: %d, Free stack: %d\n", 
+                  ESP.getFreeHeap(), 
+                  uxTaskGetStackHighWaterMark(NULL));
+  }
+}
+
 // Настройки точки доступа
 const char* ssid = "Robot_Controller";
 const char* password = "123456789";
@@ -26,7 +43,7 @@ bool servosInitialized = false;
 Servo servo[4][3];
 
 const int servo_pin[4][3] = { 
-  {2, 15, 4},     // Нога 0 - пины 2,4,16 (все работают)
+  {14, 15, 4},     // Нога 0 - пины 2,4,16 (все работают)
   {17, 16, 5},   // Нога 1 - пины 17,18,19  
   {21, 18, 19},   // Нога 2 - пины 21,22,23
   {25, 26, 27}    // Нога 3 - пины 25,26,27
@@ -34,7 +51,7 @@ const int servo_pin[4][3] = {
 
 // Пины для датчиков
 #define MQ7_PIN 34     // Аналоговый вход
-#define MQ9_PIN 35     // Аналоговый вход
+#define MQ9_PIN 23     // Аналоговый вход
 #define TRIG_PIN 32    // Trig для HC-SR04
 #define ECHO_PIN 33    // Echo для HC-SR04
 
@@ -85,10 +102,6 @@ const float turn_x1 = (temp_a - length_side) / 2;
 const float turn_y1 = y_start + y_step / 2;
 const float turn_x0 = turn_x1 - temp_b * cos(temp_alpha);
 const float turn_y0 = temp_b * sin(temp_alpha) - turn_y1 - length_side;
-
-// Таймер для сервоприводов
-hw_timer_t *servo_timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Команды робота
 #define W_STAND        0
@@ -143,22 +156,42 @@ void sendSensorDataToClient();
 float readDistance();
 void handleAutoSend();
 
-// Обработчик таймера для сервоприводов
-void IRAM_ATTR onTimer() {
-  portENTER_CRITICAL_ISR(&timerMux);
-  if (servosInitialized) {
-    servo_service();
-  }
-  portEXIT_CRITICAL_ISR(&timerMux);
-}
-
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(2000);
+
+  // Настройка WiFi
+  Serial.println("📡 Setting up WiFi...");
+  WiFi.mode(WIFI_AP);
   
+  // Конфигурация IP адреса
+  IPAddress local_IP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  
+  if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+    Serial.println("❌ AP Config Failed!");
+  }
+  
+  // Запуск точки доступа
+  if (WiFi.softAP(ssid, password)) {
+    Serial.println("✅ Access Point started successfully!");
+  } else {
+    Serial.println("❌ AP Start Failed!");
+    return;
+  }
   Serial.println();
   Serial.println("🤖 Starting Robot TCP Controller...");
+  delay(500);
+
+// Запуск TCP серверов
+  commandServer.begin();
+  sensorServer.begin();
+  Serial.println("✅ Command TCP Server started on port " + String(COMMAND_TCP_PORT));
+  Serial.println("✅ Sensor TCP Server started on port " + String(SENSOR_TCP_PORT));
   
+  delay(2000);
+
   // Инициализация датчиков
   Serial.println("🔌 Setting up sensors...");
   setupSensors();
@@ -187,10 +220,6 @@ void setup() {
 
   // Настройка таймера для сервоприводов (20ms период)
   Serial.println("⏰ Setting up servo timer...");
-  servo_timer = timerBegin(0, 80, true);
-  timerAttachInterrupt(servo_timer, &onTimer, true);
-  timerAlarmWrite(servo_timer, 20000, true);
-  timerAlarmEnable(servo_timer);
 
   // Инициализация сервоприводов
   Serial.println("🔧 Attaching servos...");
@@ -202,75 +231,18 @@ void setup() {
     servosInitialized = false;
   }
 
-  /*if (servosInitialized) {
-    Serial.println("🔧 Testing servos...");
-    
-    // Плавно протестируйте каждый сервопривод
-    for (int i = 0; i < 4; i++) {
-      for (int j = 0; j < 3; j++) {
-        Serial.printf("Testing servo[%d][%d] on pin %d\n", i, j, servo_pin[i][j]);
-        
-        // Движение от 0 до 180 градусов
-        for (int pos = 0; pos <= 180; pos += 30) {
-          servo[i][j].write(pos);
-          delay(100);
-        }
-        
-        // Возврат в нейтральное положение
-        servo[i][j].write(90);
-        delay(200);
-      }
-    }
-    
-    Serial.println("✅ Servo test completed");
-  }*/
-
-  // Настройка WiFi после инициализации сервоприводов
-  Serial.println("📡 Setting up WiFi...");
-  WiFi.mode(WIFI_AP);
-  
-  // Конфигурация IP адреса
-  IPAddress local_IP(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  
-  if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
-    Serial.println("❌ AP Config Failed!");
-  }
-  
-  // Запуск точки доступа
-  if (WiFi.softAP(ssid, password)) {
-    Serial.println("✅ Access Point started successfully!");
-  } else {
-    Serial.println("❌ AP Start Failed!");
-    return;
-  }
-  
-  delay(2000);
-  
-  // Запуск TCP серверов
-  commandServer.begin();
-  sensorServer.begin();
-  Serial.println("✅ Command TCP Server started on port " + String(COMMAND_TCP_PORT));
-  Serial.println("✅ Sensor TCP Server started on port " + String(SENSOR_TCP_PORT));
-  
-  // Вывод информации о системе
+  /*// Вывод информации о системе
   Serial.println("\n=== ROBOT CONTROLLER ===");
-  Serial.print("AP SSID:     ");
-  Serial.println(ssid);
-  Serial.print("AP IP:       ");
-  Serial.println(WiFi.softAPIP());
-  Serial.print("Command Port:");
-  Serial.println(COMMAND_TCP_PORT);
-  Serial.print("Sensor Port: ");
-  Serial.println(SENSOR_TCP_PORT);
-  Serial.print("Servos:      ");
-  Serial.println(servosInitialized ? "READY" : "FAILED");
+  Serial.printf("AP SSID:     ", ssid);
+  Serial.printf("AP IP:       %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("Command Port: %s\n", COMMAND_TCP_PORT);
+  Serial.printf("Sensor Port:  %s\n", SENSOR_TCP_PORT);
+  Serial.printf("Servos:       %s\n", servosInitialized ? "READY" : "FAILED");
   Serial.println("Sensors:     MQ-7, MQ-9, HC-SR04");
   Serial.println("Auto Send:   EVERY 1 SECOND to Sensor Port");
   Serial.println("==========================\n");
   
-  startTime = millis();
+  startTime = millis();*/
 }
 
 void setupSensors() {
@@ -363,19 +335,14 @@ bool servo_attach(void) {
     for (int j = 0; j < 3; j++) {
       int pin = servo_pin[i][j];
       
-      Serial.printf("  Servo [%d][%d] on pin %d... ", i, j, pin);
-      
-     // Минимальная настройка
+           // Минимальная настройка
       servo[i][j].setPeriodHertz(50);
       
       // Пробуем подключить самым простым способом
       if (servo[i][j].attach(pin)) {
-        Serial.println("✓ OK");
         servo[i][j].write(90); // Устанавливаем в нейтраль
         delay(100);
       } else {
-        Serial.println("❌ FAILED");
-        // Продолжаем с другими, не возвращаем false
       }
     }
   }
@@ -456,24 +423,43 @@ void handleNewConnections() {
 }
 
 void sendSystemStatus() {
-  String status = "=== ROBOT STATUS ===\r\n";
-  status += "Uptime: " + String(millis() / 1000) + "s\r\n";
-  status += "LED State: " + String(ledState ? "ON" : "OFF") + "\r\n";
-  status += "Command Clients: " + String(commandClient.connected() ? "1" : "0") + "\r\n";
-  status += "Sensor Clients: " + String(sensorClient.connected() ? "1" : "0") + "\r\n";
-  status += "Free Heap: " + String(ESP.getFreeHeap()) + " bytes\r\n";
-  status += "IP: " + WiFi.softAPIP().toString() + "\r\n";
-  status += "Command Port: " + String(COMMAND_TCP_PORT) + "\r\n";
-  status += "Sensor Port: " + String(SENSOR_TCP_PORT) + "\r\n";
-  status += "Servos: " + String(servosInitialized ? "READY" : "NOT READY") + "\r\n";
-  status += "Servo Type: 180° Standard Servos\r\n";
-  status += "Robot State: " + String(is_stand() ? "STANDING" : "SITTING") + "\r\n";
-  status += "Auto Send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED") + "\r\n";
-  status += "Sensors: MQ-7, MQ-9, HC-SR04\r\n";
-  status += "====================";
+  if (!commandClient.connected()) return;
   
-  sendCommandResponse(status);
-  Serial.println("📈 Sent system status");
+  commandClient.print("=== ROBOT STATUS ===\r\n");
+  commandClient.print("Uptime: ");
+  commandClient.print(millis() / 1000);
+  commandClient.print("s\r\n");
+  commandClient.print("LED State: ");
+  commandClient.print(ledState ? "ON" : "OFF");
+  commandClient.print("\r\n");
+  commandClient.print("Command Clients: ");
+  commandClient.print(commandClient.connected() ? "1" : "0");
+  commandClient.print("\r\n");
+  commandClient.print("Sensor Clients: ");
+  commandClient.print(sensorClient.connected() ? "1" : "0");
+  commandClient.print("\r\n");
+  commandClient.print("Free Heap: ");
+  commandClient.print(ESP.getFreeHeap());
+  commandClient.print(" bytes\r\n");
+  commandClient.print("IP: ");
+  commandClient.print(WiFi.softAPIP().toString());
+  commandClient.print("\r\n");
+  commandClient.print("Command Port: ");
+  commandClient.print(COMMAND_TCP_PORT);
+  commandClient.print("\r\n");
+  commandClient.print("Sensor Port: ");
+  commandClient.print(SENSOR_TCP_PORT);
+  commandClient.print("\r\n");
+  commandClient.print("Servos: ");
+  commandClient.print(servosInitialized ? "READY" : "NOT READY");
+  commandClient.print("\r\n");
+  commandClient.print("Robot State: ");
+  commandClient.print(is_stand() ? "STANDING" : "SITTING");
+  commandClient.print("\r\n");
+  commandClient.print("Auto Send: ");
+  commandClient.print(autoSendEnabled ? "ENABLED" : "DISABLED");
+  commandClient.print("\r\n");
+  commandClient.print("====================\r\n");
 }
 
 void processCommand(String command) {
@@ -648,6 +634,13 @@ void handleClientData() {
 }
 
 void loop() {
+   unsigned long currentMillis = millis();
+  if (currentMillis - lastServoUpdate >= SERVO_UPDATE_INTERVAL) {
+    lastServoUpdate = currentMillis;
+    if (servosInitialized) {
+      servo_service();
+    }
+  }
   // Обработка новых TCP подключений
   handleNewConnections();
   
