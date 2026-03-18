@@ -51,7 +51,7 @@ const int servo_pin[4][3] = {
 
 // Пины для датчиков
 #define MQ7_PIN 34     // Аналоговый вход
-#define MQ9_PIN 23     // Аналоговый вход
+#define MQ9_PIN 35     // Аналоговый вход
 #define TRIG_PIN 32    // Trig для HC-SR04
 #define ECHO_PIN 33    // Echo для HC-SR04
 
