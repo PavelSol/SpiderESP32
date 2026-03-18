@@ -26,9 +26,9 @@ bool servosInitialized = false;
 Servo servo[4][3];
 
 const int servo_pin[4][3] = { 
-  {2, 4, 16},     // Нога 0 - пины 2,4,16 (все работают)
-  {17, 18, 19},   // Нога 1 - пины 17,18,19  
-  {21, 15, 5},   // Нога 2 - пины 21,22,23
+  {2, 15, 4},     // Нога 0 - пины 2,4,16 (все работают)
+  {17, 16, 5},   // Нога 1 - пины 17,18,19  
+  {21, 18, 19},   // Нога 2 - пины 21,22,23
   {25, 26, 27}    // Нога 3 - пины 25,26,27
 };
 
@@ -156,10 +156,6 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  // Настройка пина для встроенного LED
-  pinMode(2, OUTPUT);
-  digitalWrite(2, LOW);
-  
   Serial.println();
   Serial.println("🤖 Starting Robot TCP Controller...");
   
@@ -206,7 +202,7 @@ void setup() {
     servosInitialized = false;
   }
 
-  if (servosInitialized) {
+  /*if (servosInitialized) {
     Serial.println("🔧 Testing servos...");
     
     // Плавно протестируйте каждый сервопривод
@@ -227,7 +223,7 @@ void setup() {
     }
     
     Serial.println("✅ Servo test completed");
-  }
+  }*/
 
   // Настройка WiFi после инициализации сервоприводов
   Serial.println("📡 Setting up WiFi...");
@@ -369,7 +365,7 @@ bool servo_attach(void) {
       
       Serial.printf("  Servo [%d][%d] on pin %d... ", i, j, pin);
       
-      // Минимальная настройка
+     // Минимальная настройка
       servo[i][j].setPeriodHertz(50);
       
       // Пробуем подключить самым простым способом
@@ -651,32 +647,6 @@ void handleClientData() {
   }
 }
 
-void blinkStatusLED() {
-  static unsigned long lastBlink = 0;
-  static bool blinkState = false;
-  
-  unsigned long blinkInterval;
-  
-  // Разная частота мигания в зависимости от состояния подключений
-  if (commandClient.connected() && sensorClient.connected()) {
-    blinkInterval = 300; // Быстрое мигание при двух подключениях
-  } else if (commandClient.connected() || sensorClient.connected()) {
-    blinkInterval = 600; // Средняя скорость при одном подключении
-  } else {
-    blinkInterval = 1200; // Медленное мигание без подключений
-  }
-  
-  if (millis() - lastBlink > blinkInterval) {
-    blinkState = !blinkState;
-    
-    if (!ledState) {
-      digitalWrite(2, blinkState ? HIGH : LOW);
-    }
-    
-    lastBlink = millis();
-  }
-}
-
 void loop() {
   // Обработка новых TCP подключений
   handleNewConnections();
@@ -688,7 +658,7 @@ void loop() {
   handleAutoSend();
   
   // Мигание LED для индикации работы
-  blinkStatusLED();
+  //blinkStatusLED();
   
   delay(10);
 }
