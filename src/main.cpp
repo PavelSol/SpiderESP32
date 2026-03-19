@@ -43,9 +43,9 @@ bool servosInitialized = false;
 Servo servo[4][3];
 
 const int servo_pin[4][3] = { 
-  {14, 15, 4},     // Нога 0 - пины 2,4,16 (все работают)
-  {17, 16, 5},   // Нога 1 - пины 17,18,19  
-  {21, 18, 19},   // Нога 2 - пины 21,22,23
+  {14, 15, 4},     // Нога 0 - пины 14,15,4 (все работают)
+  {17, 16, 5},   // Нога 1 - пины 17,16,5  
+  {12, 18, 19},   // Нога 2 - пины 12,18,19
   {25, 26, 27}    // Нога 3 - пины 25,26,27
 };
 
@@ -115,6 +115,8 @@ const float turn_y0 = temp_b * sin(temp_alpha) - turn_y1 - length_side;
 #define W_DANCE        8
 
 // Прототипы функций
+void executeNextMovementPhase();
+bool isWaitingForServo();
 void servo_service();
 bool servo_attach(void);
 void servo_detach(void);
@@ -230,6 +232,20 @@ void setup() {
     Serial.println("❌ Servo initialization failed!");
     servosInitialized = false;
   }
+  if (servosInitialized) {
+  Serial.println("🔄 Moving to initial positions...");
+  
+  // Устанавливаем скорость движения
+  move_speed = 2; // Медленно
+  
+  // Даем команду на начальные позиции
+  for (int leg = 0; leg < 4; leg++) {
+    set_site(leg, site_expect[leg][0], site_expect[leg][1], site_expect[leg][2]);
+  }
+  
+  // НЕ ждем здесь - позволим loop() обработать движение
+  Serial.println("✅ Initial positions set");
+}
 
   /*// Вывод информации о системе
   Serial.println("\n=== ROBOT CONTROLLER ===");
@@ -282,12 +298,19 @@ float readDistance() {
 }
 
 void sendSensorDataToClient() {
-  String sensorData = "SENSOR_DATA ";
-  sensorData += "MQ7:" + String(mq7Value) + ",";
-  sensorData += "MQ9:" + String(mq9Value) + ",";
-  sensorData += "DISTANCE:" + String(distance, 2);
+  if (!sensorClient.connected()) return;
   
-  sendSensorData(sensorData);
+  // Отправляем по частям, без создания больших строк
+  sensorClient.print("SENSOR_DATA ");
+  sensorClient.print("MQ7:");
+  sensorClient.print(mq7Value);
+  sensorClient.print(",");
+  sensorClient.print("MQ9:");
+  sensorClient.print(mq9Value);
+  sensorClient.print(",");
+  sensorClient.print("DISTANCE:");
+  sensorClient.print(distance, 2);
+  sensorClient.println(); // Перевод строки
 }
 
 void sendCommandResponse(String message) {
@@ -296,11 +319,11 @@ void sendCommandResponse(String message) {
   }
 }
 
-void sendSensorData(String message) {
+/*void sendSensorData(const char* message) {
   if (sensorClient.connected()) {
     sensorClient.println(message);
   }
-}
+}*/
 
 void handleAutoSend() {
   if (autoSendEnabled) {
@@ -633,30 +656,101 @@ void handleClientData() {
   }
 }
 
+struct MovementState {
+  bool isMoving;
+  unsigned int stepsRemaining;
+  int currentPhase;
+  unsigned long phaseStartTime;
+} movementState = {false, 0, 0, 0};
+
+void updateMovement() {
+  if (!movementState.isMoving) return;
+  
+  // Проверяем, достигнута ли текущая фаза
+  bool phaseComplete = true;
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      if (abs(site_now[i][j] - site_expect[i][j]) > 1.0) {
+        phaseComplete = false;
+        break;
+      }
+    }
+    if (!phaseComplete) break;
+  }
+  
+  if (phaseComplete) {
+    // Переход к следующей фазе
+    movementState.currentPhase++;
+    movementState.phaseStartTime = millis();
+    
+    // Здесь вызывайте следующую фазу движения
+    executeNextMovementPhase();
+  }
+  
+  // Таймаут безопасности
+  if (millis() - movementState.phaseStartTime > 5000) {
+    Serial.println("⚠️ Movement timeout, forcing next phase");
+    movementState.currentPhase++;
+    movementState.phaseStartTime = millis();
+    executeNextMovementPhase();
+  }
+}
+
+void executeNextMovementPhase() {
+  // Здесь логика пошагового выполнения движения
+  // В зависимости от movementState.currentPhase
+  // устанавливайте новые site_expect для ног
+}
+
 void loop() {
-   unsigned long currentMillis = millis();
+  static unsigned long last_heartbeat = 0;
+  static unsigned long loop_counter = 0;
+  loop_counter++;
+
+  if (millis() - last_heartbeat > 5000) { // Каждые 5 секунд
+    last_heartbeat = millis();
+    Serial.printf("[OK] Loop heartbeat #%lu, Heap: %d\r\n", 
+                  loop_counter, ESP.getFreeHeap());
+  }
+  
+  unsigned long currentMillis = millis();
+  
+  // Серво обновление
   if (currentMillis - lastServoUpdate >= SERVO_UPDATE_INTERVAL) {
     lastServoUpdate = currentMillis;
     if (servosInitialized) {
       servo_service();
     }
   }
-  // Обработка новых TCP подключений
-  handleNewConnections();
   
-  // Чтение данных от подключенных клиентов
+  // Сеть
+  handleNewConnections();
   handleClientData();
   
-  // Автоматическая отправка данных с датчиков на сенсорный порт
-  handleAutoSend();
+  // Датчики (раз в секунду)
+  if (currentMillis - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = currentMillis;
+    readSensors();
+    Serial.printf("📊 MQ7:%d MQ9:%d DIST:%.2fcm | Heap:%d\n", 
+                  mq7Value, mq9Value, distance, ESP.getFreeHeap());
+  }
   
-  // Мигание LED для индикации работы
-  //blinkStatusLED();
-  
-  delay(10);
+  delay(1);
 }
 
+
 // ========== ФУНКЦИИ РОБОТА ==========
+// Добавьте функцию проверки ожидания
+bool isWaitingForServo() {
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 3; j++) {
+      if (abs(site_now[i][j] - site_expect[i][j]) > 0.1) {
+        return true; // Еще движется
+      }
+    }
+  }
+  return false;
+}
 
 void action_cmd(int action_mode) {
   if (!servosInitialized) return;
@@ -750,7 +844,7 @@ void sit(void) {
   for (int leg = 0; leg < 4; leg++) {
     set_site(leg, KEEP, KEEP, z_boot);
   }
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 void stand(void) {
@@ -760,7 +854,7 @@ void stand(void) {
   for (int leg = 0; leg < 4; leg++) {
     set_site(leg, KEEP, KEEP, z_default);
   }
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 // Остальные функции робота остаются без изменений, но добавьте проверку servosInitialized в начале каждой
@@ -771,65 +865,65 @@ void turn_left(unsigned int step) {
     if (site_now[3][1] == y_start) {
       //leg 3&1 move
       set_site(3, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x1 - x_offset, turn_y1, z_default);
       set_site(1, turn_x0 - x_offset, turn_y0, z_default);
       set_site(2, turn_x1 + x_offset, turn_y1, z_default);
       set_site(3, turn_x0 + x_offset, turn_y0, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(3, turn_x0 + x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x1 + x_offset, turn_y1, z_default);
       set_site(1, turn_x0 + x_offset, turn_y0, z_default);
       set_site(2, turn_x1 - x_offset, turn_y1, z_default);
       set_site(3, turn_x0 - x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(1, turn_x0 + x_offset, turn_y0, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, x_default + x_offset, y_start, z_default);
       set_site(1, x_default + x_offset, y_start, z_up);
       set_site(2, x_default - x_offset, y_start + y_step, z_default);
       set_site(3, x_default - x_offset, y_start + y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(1, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     } else {
       //leg 0&2 move
       set_site(0, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 + x_offset, turn_y0, z_up);
       set_site(1, turn_x1 + x_offset, turn_y1, z_default);
       set_site(2, turn_x0 - x_offset, turn_y0, z_default);
       set_site(3, turn_x1 - x_offset, turn_y1, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 + x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 - x_offset, turn_y0, z_default);
       set_site(1, turn_x1 - x_offset, turn_y1, z_default);
       set_site(2, turn_x0 + x_offset, turn_y0, z_default);
       set_site(3, turn_x1 + x_offset, turn_y1, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(2, turn_x0 + x_offset, turn_y0, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, x_default - x_offset, y_start + y_step, z_default);
       set_site(1, x_default - x_offset, y_start + y_step, z_default);
       set_site(2, x_default + x_offset, y_start, z_up);
       set_site(3, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(2, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     }
   }
 }
@@ -841,65 +935,65 @@ void turn_right(unsigned int step) {
     if (site_now[2][1] == y_start) {
       //leg 2&0 move
       set_site(2, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 - x_offset, turn_y0, z_default);
       set_site(1, turn_x1 - x_offset, turn_y1, z_default);
       set_site(2, turn_x0 + x_offset, turn_y0, z_up);
       set_site(3, turn_x1 + x_offset, turn_y1, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(2, turn_x0 + x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 + x_offset, turn_y0, z_default);
       set_site(1, turn_x1 + x_offset, turn_y1, z_default);
       set_site(2, turn_x0 - x_offset, turn_y0, z_default);
       set_site(3, turn_x1 - x_offset, turn_y1, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x0 + x_offset, turn_y0, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, x_default + x_offset, y_start, z_up);
       set_site(1, x_default + x_offset, y_start, z_default);
       set_site(2, x_default - x_offset, y_start + y_step, z_default);
       set_site(3, x_default - x_offset, y_start + y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     } else {
       //leg 1&3 move
       set_site(1, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x1 + x_offset, turn_y1, z_default);
       set_site(1, turn_x0 + x_offset, turn_y0, z_up);
       set_site(2, turn_x1 - x_offset, turn_y1, z_default);
       set_site(3, turn_x0 - x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(1, turn_x0 + x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, turn_x1 - x_offset, turn_y1, z_default);
       set_site(1, turn_x0 - x_offset, turn_y0, z_default);
       set_site(2, turn_x1 + x_offset, turn_y1, z_default);
       set_site(3, turn_x0 + x_offset, turn_y0, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(3, turn_x0 + x_offset, turn_y0, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(0, x_default - x_offset, y_start + y_step, z_default);
       set_site(1, x_default - x_offset, y_start + y_step, z_default);
       set_site(2, x_default + x_offset, y_start, z_default);
       set_site(3, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
 
       set_site(3, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     }
   }
 }
@@ -911,11 +1005,11 @@ void step_forward(unsigned int step) {
     if (site_now[2][1] == y_start) {
       //leg 2&1 move
       set_site(2, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, x_default + x_offset, y_start + 2 * y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = body_move_speed;
 
@@ -923,24 +1017,24 @@ void step_forward(unsigned int step) {
       set_site(1, x_default + x_offset, y_start + 2 * y_step, z_default);
       set_site(2, x_default - x_offset, y_start + y_step, z_default);
       set_site(3, x_default - x_offset, y_start + y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = leg_move_speed;
 
       set_site(1, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(1, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(1, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     } else {
       //leg 0&3 move
       set_site(0, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, x_default + x_offset, y_start + 2 * y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = body_move_speed;
 
@@ -948,16 +1042,16 @@ void step_forward(unsigned int step) {
       set_site(1, x_default - x_offset, y_start + y_step, z_default);
       set_site(2, x_default + x_offset, y_start, z_default);
       set_site(3, x_default + x_offset, y_start + 2 * y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = leg_move_speed;
 
       set_site(3, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(3, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(3, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     }
   }
 }
@@ -969,11 +1063,11 @@ void step_back(unsigned int step) {
     if (site_now[3][1] == y_start) {
       //leg 3&0 move
       set_site(3, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(3, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(3, x_default + x_offset, y_start + 2 * y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = body_move_speed;
 
@@ -981,24 +1075,24 @@ void step_back(unsigned int step) {
       set_site(1, x_default + x_offset, y_start, z_default);
       set_site(2, x_default - x_offset, y_start + y_step, z_default);
       set_site(3, x_default - x_offset, y_start + y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = leg_move_speed;
 
       set_site(0, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     } else {
       //leg 1&2 move
       set_site(1, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(1, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(1, x_default + x_offset, y_start + 2 * y_step, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = body_move_speed;
 
@@ -1006,16 +1100,16 @@ void step_back(unsigned int step) {
       set_site(1, x_default - x_offset, y_start + y_step, z_default);
       set_site(2, x_default + x_offset, y_start + 2 * y_step, z_default);
       set_site(3, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
 
       move_speed = leg_move_speed;
 
       set_site(2, x_default + x_offset, y_start + 2 * y_step, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, x_default + x_offset, y_start, z_up);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, x_default + x_offset, y_start, z_default);
-      wait_all_reach();
+      //wait_all_reach();
     }
   }
 }
@@ -1026,7 +1120,7 @@ void body_left(int i) {
   set_site(1, site_now[1][0] + i, KEEP, KEEP);
   set_site(2, site_now[2][0] - i, KEEP, KEEP);
   set_site(3, site_now[3][0] - i, KEEP, KEEP);
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 void body_right(int i) {
@@ -1035,7 +1129,7 @@ void body_right(int i) {
   set_site(1, site_now[1][0] - i, KEEP, KEEP);
   set_site(2, site_now[2][0] + i, KEEP, KEEP);
   set_site(3, site_now[3][0] + i, KEEP, KEEP);
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 void hand_wave(int i) {
@@ -1052,12 +1146,12 @@ void hand_wave(int i) {
     move_speed = body_move_speed;
     for (int j = 0; j < i; j++) {
       set_site(2, turn_x1, turn_y1, 50);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, turn_x0, turn_y0, 50);
-      wait_all_reach();
+      //wait_all_reach();
     }
     set_site(2, x_tmp, y_tmp, z_tmp);
-    wait_all_reach();
+    //wait_all_reach();
     move_speed = 1;
     body_left(15);
   } else {
@@ -1068,12 +1162,12 @@ void hand_wave(int i) {
     move_speed = body_move_speed;
     for (int j = 0; j < i; j++) {
       set_site(0, turn_x1, turn_y1, 50);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, turn_x0, turn_y0, 50);
-      wait_all_reach();
+      //wait_all_reach();
     }
     set_site(0, x_tmp, y_tmp, z_tmp);
-    wait_all_reach();
+    //wait_all_reach();
     move_speed = 1;
     body_right(15);
   }
@@ -1085,7 +1179,7 @@ void head_up(int i) {
   set_site(1, KEEP, KEEP, site_now[1][2] + i);
   set_site(2, KEEP, KEEP, site_now[2][2] - i);
   set_site(3, KEEP, KEEP, site_now[3][2] + i);
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 void head_down(int i) {
@@ -1094,7 +1188,7 @@ void head_down(int i) {
   set_site(1, KEEP, KEEP, site_now[1][2] - i);
   set_site(2, KEEP, KEEP, site_now[2][2] + i);
   set_site(3, KEEP, KEEP, site_now[3][2] - i);
-  wait_all_reach();
+  //wait_all_reach();
 }
 
 void body_dance(int i) {
@@ -1109,13 +1203,13 @@ void body_dance(int i) {
   set_site(1, x_default, y_default, KEEP);
   set_site(2, x_default, y_default, KEEP);
   set_site(3, x_default, y_default, KEEP);
-  wait_all_reach();
+  //wait_all_reach();
   
   set_site(0, x_default, y_default, z_default - 20);
   set_site(1, x_default, y_default, z_default - 20);
   set_site(2, x_default, y_default, z_default - 20);
   set_site(3, x_default, y_default, z_default - 20);
-  wait_all_reach();
+  //wait_all_reach();
   
   move_speed = body_dance_speed;
   head_up(30);
@@ -1126,12 +1220,12 @@ void body_dance(int i) {
     set_site(1, KEEP, y_default + 20, KEEP);
     set_site(2, KEEP, y_default - 20, KEEP);
     set_site(3, KEEP, y_default + 20, KEEP);
-    wait_all_reach();
+    //wait_all_reach();
     set_site(0, KEEP, y_default + 20, KEEP);
     set_site(1, KEEP, y_default - 20, KEEP);
     set_site(2, KEEP, y_default + 20, KEEP);
     set_site(3, KEEP, y_default - 20, KEEP);
-    wait_all_reach();
+    //wait_all_reach();
   }
   move_speed = body_dance_speed;
   head_down(30);
@@ -1151,12 +1245,12 @@ void hand_shake(int i) {
     move_speed = body_move_speed;
     for (int j = 0; j < i; j++) {
       set_site(2, x_default - 30, y_start + 2 * y_step, 55);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(2, x_default - 30, y_start + 2 * y_step, 10);
-      wait_all_reach();
+      //wait_all_reach();
     }
     set_site(2, x_tmp, y_tmp, z_tmp);
-    wait_all_reach();
+    //wait_all_reach();
     move_speed = 1;
     body_left(15);
   } else {
@@ -1167,12 +1261,12 @@ void hand_shake(int i) {
     move_speed = body_move_speed;
     for (int j = 0; j < i; j++) {
       set_site(0, x_default - 30, y_start + 2 * y_step, 55);
-      wait_all_reach();
+      //wait_all_reach();
       set_site(0, x_default - 30, y_start + 2 * y_step, 10);
-      wait_all_reach();
+      //wait_all_reach();
     }
     set_site(0, x_tmp, y_tmp, z_tmp);
-    wait_all_reach();
+    //wait_all_reach();
     move_speed = 1;
     body_right(15);
   }
@@ -1181,8 +1275,9 @@ void hand_shake(int i) {
 void servo_service(void) {
   if (!servosInitialized) return;
   
+  static unsigned long lastDebug = 0;
   static float alpha, beta, gamma;
-
+  
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 3; j++) {
       if (abs(site_now[i][j] - site_expect[i][j]) >= abs(temp_speed[i][j]))
@@ -1190,95 +1285,222 @@ void servo_service(void) {
       else
         site_now[i][j] = site_expect[i][j];
     }
-
+    
     cartesian_to_polar(alpha, beta, gamma, site_now[i][0], site_now[i][1], site_now[i][2]);
     polar_to_servo(i, alpha, beta, gamma);
   }
-
+  
+  // Отладка раз в секунду
+  if (millis() - lastDebug > 1000) {
+    lastDebug = millis();
+    Serial.printf("Servo service running - leg0: (%.1f,%.1f,%.1f)\n", 
+                  site_now[0][0], site_now[0][1], site_now[0][2]);
+  }
+  
   rest_counter++;
 }
 
 void set_site(int leg, float x, float y, float z) {
-  float length_x = 0, length_y = 0, length_z = 0;
+  // Сохраняем текущие позиции как цель, если параметр KEEP
+  float target_x = (x == KEEP) ? site_expect[leg][0] : x;
+  float target_y = (y == KEEP) ? site_expect[leg][1] : y;
+  float target_z = (z == KEEP) ? site_expect[leg][2] : z;
 
-  if (x != KEEP) length_x = x - site_now[leg][0];
-  if (y != KEEP) length_y = y - site_now[leg][1];
-  if (z != KEEP) length_z = z - site_now[leg][2];
+  // Вычисляем разницу
+  float dx = target_x - site_now[leg][0];
+  float dy = target_y - site_now[leg][1];
+  float dz = target_z - site_now[leg][2];
 
-  float length = sqrt(pow(length_x, 2) + pow(length_y, 2) + pow(length_z, 2));
+  float distance = sqrt(dx*dx + dy*dy + dz*dz);
 
-  temp_speed[leg][0] = length_x / length * move_speed * speed_multiple;
-  temp_speed[leg][1] = length_y / length * move_speed * speed_multiple;
-  temp_speed[leg][2] = length_z / length * move_speed * speed_multiple;
+  // Защита от деления на ноль и малых расстояний
+  if (distance < 0.1) {
+    temp_speed[leg][0] = 0;
+    temp_speed[leg][1] = 0;
+    temp_speed[leg][2] = 0;
+  } else {
+    temp_speed[leg][0] = (dx / distance) * move_speed * speed_multiple;
+    temp_speed[leg][1] = (dy / distance) * move_speed * speed_multiple;
+    temp_speed[leg][2] = (dz / distance) * move_speed * speed_multiple;
+  }
 
+  // Устанавливаем ожидаемую позицию
   if (x != KEEP) site_expect[leg][0] = x;
   if (y != KEEP) site_expect[leg][1] = y;
   if (z != KEEP) site_expect[leg][2] = z;
 }
 
 void wait_reach(int leg) {
+  unsigned long startTime = millis();
+  unsigned long timeout = 5000; // 5 секунд максимум
   while (1) {
     if (site_now[leg][0] == site_expect[leg][0] && 
         site_now[leg][1] == site_expect[leg][1] && 
         site_now[leg][2] == site_expect[leg][2]) {
       break;
     }
-    delay(1);
+
+    // Таймаут на случай проблем
+    if (millis() - startTime > timeout) {
+      Serial.printf("⚠️ Timeout waiting for leg %d\n", leg);
+      break;
+    }
+    
+    // Даем время другим процессам
+    delay(5);
+    
+    // ВАЖНО: вызываем servo_service для обновления позиций
+    if (servosInitialized) {
+      servo_service();
+    }
   }
+  
 }
 
 void wait_all_reach(void) {
   for (int i = 0; i < 4; i++) {
     wait_reach(i);
+    
   }
 }
 
 void cartesian_to_polar(float &alpha, float &beta, float &gamma, float x, float y, float z) {
-  float v, w;
-  w = (x >= 0 ? 1 : -1) * (sqrt(pow(x, 2) + pow(y, 2)));
-  v = w - length_c;
+  // ------------------------------------------------------------
+  // 1. ЗАЩИТА ОТ ПЛОХИХ ВХОДНЫХ ДАННЫХ
+  // ------------------------------------------------------------
+  if (isnan(x) || isnan(y) || isnan(z) || isinf(x) || isinf(y) || isinf(z)) {
+    Serial.println("❌ CRASH GUARD: Bad input to cartesian_to_polar");
+    alpha = 90; beta = 90; gamma = 90;
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // 2. ВЫЧИСЛЕНИЕ w И v С ЗАЩИТОЙ
+  // ------------------------------------------------------------
+  float x_sq = x * x;
+  float y_sq = y * y;
   
-  // Исправленное вычисление углов
-  alpha = atan2(z, v) + acos((pow(length_a, 2) - pow(length_b, 2) + pow(v, 2) + pow(z, 2)) / (2 * length_a * sqrt(pow(v, 2) + pow(z, 2))));
-  beta = acos((pow(length_a, 2) + pow(length_b, 2) - pow(v, 2) - pow(z, 2)) / (2 * length_a * length_b));
-  gamma = (w >= 0) ? atan2(y, x) : atan2(-y, -x);
+  // Защита от переполнения и отрицательного корня
+  float hypot_sq = x_sq + y_sq;
+  if (hypot_sq < 0) hypot_sq = 0;
   
-  // Правильное преобразование радиан в градусы
-  alpha = alpha * 180 / pi;
-  beta = beta * 180 / pi;
-  gamma = gamma * 180 / pi;
+  float w = (x >= 0 ? 1 : -1) * sqrt(hypot_sq);
+  float v = w - length_c;
+
+  // ------------------------------------------------------------
+  // 3. ВЫЧИСЛЕНИЕ alpha (САМОЕ ОПАСНОЕ МЕСТО)
+  // ------------------------------------------------------------
+  float v_sq = v * v;
+  float z_sq = z * z;
+  float under_root_alpha = v_sq + z_sq;
+
+  // Защита корня
+  if (under_root_alpha < 0) under_root_alpha = 0;
+  float root_alpha = sqrt(under_root_alpha);
+
+  // Защита от деления на ноль
+  if (root_alpha < 0.001) root_alpha = 0.001;
+
+  // Вычисление аргумента для acos (самая частая причина NaN)
+  float acos_alpha_num = (length_a * length_a) - (length_b * length_b) + v_sq + z_sq;
+  float acos_alpha_den = 2 * length_a * root_alpha;
+  
+  // Самая жесткая защита
+  if (acos_alpha_den == 0) acos_alpha_den = 0.001;
+  
+  float acos_alpha_arg = acos_alpha_num / acos_alpha_den;
+  
+  // Обрезка до строгого диапазона [-1, 1] для acos
+  if (acos_alpha_arg > 1.0) acos_alpha_arg = 1.0;
+  if (acos_alpha_arg < -1.0) acos_alpha_arg = -1.0;
+
+  // Финальное вычисление alpha
+  alpha = atan2(z, v) + acos(acos_alpha_arg);
+
+  // ------------------------------------------------------------
+  // 4. ВЫЧИСЛЕНИЕ beta
+  // ------------------------------------------------------------
+  float acos_beta_num = (length_a * length_a) + (length_b * length_b) - v_sq - z_sq;
+  float acos_beta_den = 2 * length_a * length_b;
+  
+  if (acos_beta_den == 0) acos_beta_den = 0.001;
+  
+  float acos_beta_arg = acos_beta_num / acos_beta_den;
+  
+  if (acos_beta_arg > 1.0) acos_beta_arg = 1.0;
+  if (acos_beta_arg < -1.0) acos_beta_arg = -1.0;
+  
+  beta = acos(acos_beta_arg);
+
+  // ------------------------------------------------------------
+  // 5. ВЫЧИСЛЕНИЕ gamma
+  // ------------------------------------------------------------
+  if (fabs(x) < 0.001 && fabs(y) < 0.001) {
+    gamma = 0; // atan2(0,0) недопустим
+  } else {
+    gamma = (w >= 0) ? atan2(y, x) : atan2(-y, -x);
+  }
+
+  // ------------------------------------------------------------
+  // 6. ПРЕОБРАЗОВАНИЕ В ГРАДУСЫ
+  // ------------------------------------------------------------
+  alpha = alpha * 180.0 / pi;
+  beta = beta * 180.0 / pi;
+  gamma = gamma * 180.0 / pi;
+
+  // ------------------------------------------------------------
+  // 7. ФИНАЛЬНАЯ ПРОВЕРКА НА ОШИБКИ
+  // ------------------------------------------------------------
+  if (isnan(alpha) || isnan(beta) || isnan(gamma) ||
+      isinf(alpha) || isinf(beta) || isinf(gamma)) {
+    
+    Serial.printf("❌ MATH ERROR: (%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f)\r\n",
+                  x, y, z, alpha, beta, gamma);
+    
+    // Безопасные значения по умолчанию
+    alpha = 90;
+    beta = 90;
+    gamma = 90;
+  }
 }
 
 void polar_to_servo(int leg, float alpha, float beta, float gamma) {
   if (!servosInitialized) return;
   
+  // Проверка на NaN
+  if (isnan(alpha) || isnan(beta) || isnan(gamma)) {
+    Serial.printf("⚠️ NaN in polar_to_servo for leg %d\n", leg);
+    return;
+  }
+  
+  float a = alpha, b = beta, g = gamma;
+  
+  // Применяем преобразования для каждой ноги
   if (leg == 0) {
-    alpha = 90 - alpha;
-    beta = beta;
-    gamma += 90;
+    a = 90 - alpha;
+    b = beta;
+    g = gamma + 90;
   } else if (leg == 1) {
-    alpha += 90;
-    beta = 180 - beta;
-    gamma = 90 - gamma;
+    a = alpha + 90;
+    b = 180 - beta;
+    g = 90 - gamma;
   } else if (leg == 2) {
-    alpha += 90;
-    beta = 180 - beta;
-    gamma = 90 - gamma;
+    a = alpha + 90;
+    b = 180 - beta;
+    g = 90 - gamma;
   } else if (leg == 3) {
-    alpha = 90 - alpha;
-    beta = beta;
-    gamma += 90;
+    a = 90 - alpha;
+    b = beta;
+    g = gamma + 90;
   }
 
-  // Ограничиваем углы в пределах 0-180 градусов для безопасности
-  alpha = constrain(alpha, 0, 180);
-  beta = constrain(beta, 0, 180);
-  gamma = constrain(gamma, 0, 180);
+  // Ограничиваем углы в пределах 0-180 градусов
+  a = constrain(a, 0.0, 180.0);
+  b = constrain(b, 0.0, 180.0);
+  g = constrain(g, 0.0, 180.0);
   
-  // Для отладки можно раскомментировать:
-  // Serial.printf("Leg %d: A=%.1f, B=%.1f, G=%.1f\n", leg, alpha, beta, gamma);
-  
-  servo[leg][0].write(alpha);
-  servo[leg][1].write(beta);
-  servo[leg][2].write(gamma);
+  // Отправляем значения сервоприводам
+  servo[leg][0].write((int)a);
+  servo[leg][1].write((int)b);
+  servo[leg][2].write((int)g);
 }
