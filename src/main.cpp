@@ -45,7 +45,7 @@ const char* password = "123456789";
 #define MQ9_PIN 35
 #define TRIG_PIN 32
 #define ECHO_PIN 33
-#define BATTERY_PIN 12
+//#define BATTERY_PIN 12
 
 // Интервалы
 const unsigned long SERVO_UPDATE_INTERVAL = 20;
@@ -156,6 +156,7 @@ WiFiServer sensorServer(SENSOR_TCP_PORT);
 WiFiClient sensorClient;
 
 // Прототипы функций
+bool is_reach_position(int leg, float x, float y, float z);
 void setupWiFi();
 void setupWebServer();
 void setupOTA();
@@ -170,7 +171,9 @@ void addEvent(LogLevel level, const char* message);
 void sendRecentEvents();
 void runSelfTest();
 void calibrateLegPositions();
-void checkBattery();
+void simpleServoTest();
+void debugKinematicsCheck();
+//void checkBattery();
 void checkTemperature();
 void checkEmergency();
 void checkStackUsage();
@@ -220,7 +223,7 @@ void hand_shake(int i);
 void action_cmd(int action_mode);
 void do_test();
 float readDistance();
-float readBatteryVoltage();
+//float readBatteryVoltage();
 float getTemperature();
 
 // HTML для веб‑интерфейса
@@ -271,6 +274,17 @@ void setup() {
   // Инициализация EEPROM
   EEPROM.begin(EEPROM_SIZE);
   loadCalibration();
+  debugKinematicsCheck();
+  logMessage(DEBUG, "🛠️  Loaded calibration offsets:");
+for (int leg = 0; leg < 4; leg++) {
+  char buffer[64];
+  snprintf(buffer, sizeof(buffer), "Leg %d: %d, %d, %d",
+           leg,
+           calibration.offset[leg][0],
+           calibration.offset[leg][1],
+           calibration.offset[leg][2]);
+  logMessage(DEBUG, buffer);
+}
   loadState();
   initCache();
 
@@ -288,11 +302,25 @@ void setup() {
 
   // Калибровка ног
   calibrateLegPositions();
+  simpleServoTest();
 
   // Проверка самодиагностики
   runSelfTest();
 
   logMessage(INFO, "✅ System Ready!");
+  if (!servo_attach()) {
+  logMessage(ERROR, "❌ Failed to attach servos!");
+} else {
+  logMessage(INFO, "✅ Servos attached successfully");
+  // Краткий тест движения
+  delay(1000);
+  for (int leg = 0; leg < 4; leg++) {
+    for (int joint = 0; joint < 3; joint++) {
+      servo[leg][joint].write(90);
+    }
+  }
+  logMessage(INFO, "🦾 Servos moved to 90° position");
+}
 }
 
 void loop() {
@@ -312,7 +340,7 @@ void loop() {
   handleAutoSend();
 
   // Проверка батареи
-  checkBattery();
+  //checkBattery();
 
   // Проверка температуры
   checkTemperature();
@@ -400,6 +428,36 @@ void addEvent(LogLevel level, const char* message) {
   }
 }
 
+void debugKinematicsCheck() {
+  logMessage(DEBUG, "🔎 Kinematics calculation test:");
+  float testX = x_default;
+  float testY = y_default;
+  float testZ = z_default;
+
+  for (int leg = 0; leg < 4; leg++) {
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer),
+             "Leg %d test at (%.1f, %.1f, %.1f)",
+             leg, testX, testY, testZ);
+    logMessage(DEBUG, buffer);
+
+    float alpha, beta, gamma;
+    cartesian_to_polar(alpha, beta, gamma, testX, testY, testZ);
+
+    snprintf(buffer, sizeof(buffer),
+             "Calculated angles: alpha=%.1f°, beta=%.1f°, gamma=%.1f°",
+             alpha, beta, gamma);
+    logMessage(DEBUG, buffer);
+
+    // Проверка на ошибки расчёта
+    if (alpha == 0 && beta == 0 && gamma == 0) {
+    char message[256];
+    snprintf(message, sizeof(message), "⚠️ Kinematics failed for leg %d", leg);
+    logMessage(WARNING, message);
+}
+  }
+}
+
 void sendRecentEvents() {
   if (!commandClient.connected()) return;
 
@@ -424,17 +482,46 @@ void runSelfTest() {
 }
 
 void calibrateLegPositions() {
+  if (emergencyStop) {
+  logMessage(ERROR, "🚨 Calibration blocked by emergency stop");
+  return;
+}
   logMessage(INFO, "🛠️  Starting leg calibration...");
   float defaultPos[3] = {x_default, y_default, z_default};
 
   for (int leg = 0; leg < 4; leg++) {
+    logMessage(DEBUG, ("Moving leg " + String(leg) + " to default position").c_str());
+
     set_site(leg, defaultPos[0], defaultPos[1], defaultPos[2]);
-    delay(1000); // Ждём завершения движения
+
+    // Ждём достижения позиции с таймаутом
+    unsigned long startTime = millis();
+    while (millis() - startTime < 3000) {  // 3‑секундный таймаут
+      if (is_reach_position(leg, defaultPos[0], defaultPos[1], defaultPos[2])) {
+        char buffer[64];
+        snprintf(buffer, sizeof(buffer), "✅ Leg %d reached target", leg);
+        logMessage(DEBUG, buffer);
+        break;
+      }
+      delay(50);
+    }
+
+    if (!is_reach_position(leg, defaultPos[0], defaultPos[1], defaultPos[2])) {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "⚠️ Leg %d did not reach target", leg);
+      logMessage(WARNING, buffer);
+    }
   }
   logMessage(INFO, "🛠️  Leg calibration completed");
 }
 
-void checkBattery() {
+bool is_reach_position(int leg, float x, float y, float z) {
+  return (abs(site_now[leg][0] - x) <= 5 &&
+          abs(site_now[leg][1] - y) <= 5 &&
+          abs(site_now[leg][2] - z) <= 5);
+}
+
+/*void checkBattery() {
   float voltage = readBatteryVoltage();
   if (voltage < 3.7) { // Критическое напряжение LiPo
     char buffer[64]; // Буфер достаточного размера для сообщений
@@ -447,7 +534,7 @@ void checkBattery() {
     snprintf(buffer, sizeof(buffer), "⚠️ Low battery: %.2fV", voltage);
     sendCommandResponse(buffer);
   }
-}
+}*/
 
 void checkTemperature() {
   // Реализация проверки температуры (при наличии датчика)
@@ -516,7 +603,7 @@ void processCommand(String command) {
 void setupSensors() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(BATTERY_PIN, INPUT);
+  //pinMode(BATTERY_PIN, INPUT);
 
   // Инициализация I2C для датчиков температуры (если есть)
   Wire.begin();
@@ -560,11 +647,11 @@ float readDistance() {
   return duration * 0.034 / 2; // см
 }
 
-float readBatteryVoltage() {
-  int sensorValue = analogRead(BATTERY_PIN);
+/*float readBatteryVoltage() {
+ // int sensorValue = analogRead(BATTERY_PIN);
   float voltage = sensorValue * (3.3 / 4095.0); // Для ESP32
   return voltage * 2; // Делитель напряжения 1:2
-}
+}*/
 
 float getTemperature() {
   // Заглушка — реализация зависит от используемого датчика
@@ -576,7 +663,7 @@ void sendSensorDataToClient() {
     String data = "MQ7:" + String(mq7Value) +
                 ",MQ9:" + String(mq9Value) +
                 ",DIST:" + String(distance, 1) +
-                ",BAT:" + String(readBatteryVoltage(), 2) +
+                /*",BAT:" + String(readBatteryVoltage(), 2) +*/
                 ",TEMP:" + String(getTemperature(), 1);
     sendSensorData(data);
   }
@@ -601,14 +688,88 @@ void autoSaveSettings() {
 }
 
 void loadCalibration() {
+  logMessage(DEBUG, "Loading calibration from EEPROM...");
   EEPROM.get(0, calibration);
-  logMessage(INFO, "🛠️  Calibration loaded");
+
+  char buffer[64];
+  for (int leg = 0; leg < 4; leg++) {
+    snprintf(buffer, sizeof(buffer), "Leg %d offsets: %d, %d, %d",
+             leg,
+             calibration.offset[leg][0],
+             calibration.offset[leg][1],
+             calibration.offset[leg][2]);
+    logMessage(DEBUG, buffer);
+  }
+
+  // Если все значения -1, используем дефолтные
+  bool allMinusOne = true;
+  for (int leg = 0; leg < 4; leg++) {
+    for (int joint = 0; joint < 3; joint++) {
+      if (calibration.offset[leg][joint] != -1) {
+        allMinusOne = false;
+        break;
+      }
+    }
+  }
+
+  if (allMinusOne) {
+    logMessage(WARNING, "⚠️ Using default calibration (0,0,0)");
+    for (int leg = 0; leg < 4; leg++) {
+      for (int joint = 0; joint < 3; joint++) {
+        calibration.offset[leg][joint] = 0;
+      }
+    }
+    saveCalibration();
+  }
 }
 
 void saveCalibration() {
+  logMessage(DEBUG, "Saving calibration to EEPROM...");
   EEPROM.put(0, calibration);
   EEPROM.commit();
-  logMessage(INFO, "🛠️  Calibration saved");
+
+  // Дополнительная проверка после сохранения
+  ServoCalibration testRead;
+  EEPROM.get(0, testRead);
+  bool match = true;
+  for (int leg = 0; leg < 4; leg++) {
+    for (int joint = 0; joint < 3; joint++) {
+      if (testRead.offset[leg][joint] != calibration.offset[leg][joint]) {
+        match = false;
+      }
+    }
+  }
+  if (match) {
+    logMessage(INFO, "🛠️  Calibration saved and verified");
+  } else {
+    logMessage(ERROR, "❌ Calibration save failed — data mismatch");
+  }
+}
+
+void simpleServoTest() {
+  logMessage(INFO, "🧪 Simple servo test started");
+
+  for (int leg = 0; leg < 4; leg++) {
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Testing leg %d", leg);
+    logMessage(DEBUG, buffer);
+
+    // Прямое управление без плавного движения
+    servo[leg][0].write(60);  // альфа
+    delay(500);
+    servo[leg][1].write(60);  // бета
+    delay(500);
+    servo[leg][2].write(60);  // гамма
+    delay(1000);
+
+    // Возврат в центр
+    servo[leg][0].write(90);
+    servo[leg][1].write(90);
+    servo[leg][2].write(90);
+    delay(800);
+  }
+
+  logMessage(INFO, "🧪 Servo test completed");
 }
 
 void loadState() {
@@ -801,34 +962,52 @@ bool cartesian_to_polar_cached(float &alpha, float &beta, float &gamma,
 }
 
 void polar_to_servo(int leg, float alpha, float beta, float gamma) {
-  // Преобразование углов в позиции сервоприводов с учётом калибровки
-  int alpha_pos = 90 + (int)alpha + calibration.offset[leg][0];
-  int beta_pos = 90 - (int)beta + calibration.offset[leg][1];
-  int gamma_pos = 90 - (int)gamma + calibration.offset[leg][2];
+  // Проверка допустимых диапазонов
+  if (alpha < -90 || alpha > 90 ||
+      beta < -90 || beta > 90 ||
+      gamma < -90 || gamma > 90) {
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer),
+             "⚠️ Invalid angles for leg %d: alpha=%.1f°, beta=%.1f°, gamma=%.1f°",
+             leg, alpha, beta, gamma);
+    logMessage(WARNING, buffer);
+    return;
+  }
 
-  // Плавное движение
-  smoothServoMove(leg, 0, alpha_pos, 200);
-  smoothServoMove(leg, 1, beta_pos, 200);
-  smoothServoMove(leg, 2, gamma_pos, 200);
+  int alpha_pos = 90 + (int)alpha;
+  int beta_pos = 90 - (int)beta;
+  int gamma_pos = 90 - (int)gamma;
+
+  // Применяем калибровку
+  alpha_pos += calibration.offset[leg][0];
+  beta_pos += calibration.offset[leg][1];
+  gamma_pos += calibration.offset[leg][2];
+
+  servo[leg][0].write(alpha_pos);
+  servo[leg][1].write(beta_pos);
+  servo[leg][2].write(gamma_pos);
 }
 
 void set_site(int leg, float x, float y, float z) {
+  char buffer[128];
+  snprintf(buffer, sizeof(buffer),
+           "Leg %d: setting position (%.1f, %.1f, %.1f)",
+           leg, x, y, z);
+  logMessage(DEBUG, buffer);
+
   site_expect[leg][0] = x;
   site_expect[leg][1] = y;
   site_expect[leg][2] = z;
 
   float alpha, beta, gamma;
-  if (!cartesian_to_polar_cached(alpha, beta, gamma, x, y, z, leg, 0)) {
-    polar_to_servo(leg, alpha, beta, gamma);
-  }
-}
+  cartesian_to_polar(alpha, beta, gamma, x, y, z);
 
-void wait_reach(int leg) {
-  while (abs(site_now[leg][0] - site_expect[leg][0]) > 1 ||
-         abs(site_now[leg][1] - site_expect[leg][1]) > 1 ||
-         abs(site_now[leg][2] - site_expect[leg][2]) > 1) {
-    delay(10);
-  }
+  snprintf(buffer, sizeof(buffer),
+           "Calculated angles: alpha=%.1f°, beta=%.1f°, gamma=%.1f°",
+           alpha, beta, gamma);
+  logMessage(DEBUG, buffer);
+
+  polar_to_servo(leg, alpha, beta, gamma);
 }
 
 void wait_all_reach() {
