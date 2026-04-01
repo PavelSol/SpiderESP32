@@ -45,7 +45,6 @@ const char* password = "123456789";
 #define MQ9_PIN 35
 #define TRIG_PIN 32
 #define ECHO_PIN 33
-//#define BATTERY_PIN 12
 
 // Интервалы
 const unsigned long SERVO_UPDATE_INTERVAL = 20;
@@ -226,45 +225,6 @@ float readDistance();
 //float readBatteryVoltage();
 float getTemperature();
 
-// HTML для веб‑интерфейса
-const char* htmlPage = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Robot Controller</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: Arial; text-align: center; }
-    button { padding: 15px; margin: 10px; font-size: 16px; }
-    .status { color: green; }
-  </style>
-</head>
-<body>
-  <h1>🤖 Robot Controller</h1>
-  <div>
-    <button onclick="sendCommand('STAND')">Stand</button>
-    <button onclick="sendCommand('SIT')">Sit</button>
-  </div>
-  <div>
-    <button onclick="sendCommand('FORWARD')">Forward</button>
-    <button onclick="sendCommand('BACKWARD')">Backward</button>
-  </div>
-  <div id="status" class="status"></div>
-
-  <script>
-    function sendCommand(cmd) {
-      fetch('/command?action=' + cmd)
-        .then(r => r.text())
-        .then(data => {
-          document.getElementById('status').innerHTML = data;
-          setTimeout(() => document.getElementById('status').innerHTML = '', 3000);
-        });
-    }
-  </script>
-</body>
-</html>
-)rawliteral";
-
 // === РЕАЛИЗАЦИЯ ФУНКЦИЙ ===
 
 void setup() {
@@ -338,9 +298,6 @@ void loop() {
 
   // Автоотправка данных датчиков
   handleAutoSend();
-
-  // Проверка батареи
-  //checkBattery();
 
   // Проверка температуры
   checkTemperature();
@@ -521,21 +478,6 @@ bool is_reach_position(int leg, float x, float y, float z) {
           abs(site_now[leg][2] - z) <= 5);
 }
 
-/*void checkBattery() {
-  float voltage = readBatteryVoltage();
-  if (voltage < 3.7) { // Критическое напряжение LiPo
-    char buffer[64]; // Буфер достаточного размера для сообщений
-
-    // Формируем сообщение для logMessage
-    snprintf(buffer, sizeof(buffer), "Low battery: %.2fV", voltage);
-    logMessage(WARNING, buffer);
-
-    // Формируем сообщение для sendCommandResponse (с эмодзи)
-    snprintf(buffer, sizeof(buffer), "⚠️ Low battery: %.2fV", voltage);
-    sendCommandResponse(buffer);
-  }
-}*/
-
 void checkTemperature() {
   // Реализация проверки температуры (при наличии датчика)
 }
@@ -646,12 +588,6 @@ float readDistance() {
   long duration = pulseIn(ECHO_PIN, HIGH);
   return duration * 0.034 / 2; // см
 }
-
-/*float readBatteryVoltage() {
- // int sensorValue = analogRead(BATTERY_PIN);
-  float voltage = sensorValue * (3.3 / 4095.0); // Для ESP32
-  return voltage * 2; // Делитель напряжения 1:2
-}*/
 
 float getTemperature() {
   // Заглушка — реализация зависит от используемого датчика
