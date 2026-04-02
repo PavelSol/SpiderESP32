@@ -251,8 +251,12 @@ for (int leg = 0; leg < 4; leg++) {
   // Настройка WiFi
   setupWiFi();
 
-  // Настройка веб‑сервера
-  setupWebServer();
+  commandServer.begin();
+  sensorServer.begin();
+  Serial.println("✅ Command TCP Server started on port " + String(COMMAND_TCP_PORT));
+  Serial.println("✅ Sensor TCP Server started on port " + String(SENSOR_TCP_PORT));
+
+  delay(2000);
 
   // Настройка OTA
   setupOTA();
@@ -292,18 +296,21 @@ void loop() {
 
   // Мониторинг соединений
   monitorConnections();
+  
+  // Обработка новых TCP-подключений
+  handleNewConnections();
 
   // Обработка клиентских данных
   handleClientData();
 
-  // Автоотправка данных датчиков
+  /*// Автоотправка данных датчиков
   handleAutoSend();
 
   // Проверка температуры
   checkTemperature();
 
   // Проверка аварийного останова
-  checkEmergency();
+  checkEmergency();*/
 
   // Автосохранение настроек
   autoSaveSettings();
@@ -348,14 +355,51 @@ void setupWebServer() {
   logMessage(INFO, "🌐 Web server started on port 80");
 }
 
-void handleRoot() {
+/*void handleRoot() {
   server.send(200, "text/html", htmlPage);
-}
+}*/
 
 void handleCommand() {
   String command = server.arg("action");
   processCommand(command);
   server.send(200, "text/plain", "Command sent: " + command);
+}
+
+void handleNewConnections() {
+  // Обработка новых подключений к командному серверу
+  if (commandServer.hasClient()) {
+    if (commandClient.connected()) {
+      WiFiClient newClient = commandServer.available();
+      newClient.stop();
+      Serial.println("⚠️  New command connection rejected - client already connected");
+    } else {
+      commandClient = commandServer.available();
+      Serial.println("✅ New Command TCP client connected!");
+      
+      String welcomeMsg = "🤖 Welcome to Robot Command Controller!\r\n";
+      welcomeMsg += "Available commands:\r\n";
+      welcomeMsg += "0 or STAND    - Stand up\r\n";
+      welcomeMsg += "1 or SIT      - Sit down\r\n";
+      welcomeMsg += "2 or FORWARD  - Step forward\r\n";
+      welcomeMsg += "3 or BACKWARD - Step backward\r\n";
+      welcomeMsg += "4 or LEFT     - Turn left\r\n";
+      welcomeMsg += "5 or RIGHT    - Turn right\r\n";
+      welcomeMsg += "6 or SHAKE    - Hand shake\r\n";
+      welcomeMsg += "7 or WAVE     - Hand wave\r\n";
+      welcomeMsg += "8 or DANCE    - Dance\r\n";
+      welcomeMsg += "TEST          - Run test sequence\r\n";
+      welcomeMsg += "STATUS        - System status\r\n";
+      welcomeMsg += "SENSORS       - Get sensor data\r\n";
+      welcomeMsg += "AUTO_ON       - Enable auto send to sensor port\r\n";
+      welcomeMsg += "AUTO_OFF      - Disable auto send to sensor port\r\n";
+      welcomeMsg += "HELP          - Show this message\r\n";
+      welcomeMsg += "---\r\n";
+      welcomeMsg += "📊 Sensor data is automatically sent to port " + String(SENSOR_TCP_PORT) + " every 1 second\r\n";
+      welcomeMsg += "Current auto send: " + String(autoSendEnabled ? "ENABLED" : "DISABLED");
+      
+      commandClient.print(welcomeMsg);
+    }
+  }
 }
 
 void logMessage(LogLevel level, const char* message) {
@@ -539,7 +583,53 @@ void handleClientData() {
 
 void processCommand(String command) {
   command.toUpperCase();
-  // Реализация обработки команд с параметрами (см. предыдущий ответ)
+  command.trim(); // Убираем лишние пробелы и символы
+
+
+  if (command == "1" || command == "STAND") {
+    stand();
+    sendCommandResponse("Executing: STAND");
+  } else if (command == "2" || command == "SIT") {
+    sit();
+    sendCommandResponse("Executing: SIT");
+  } else if (command == "3" || command == "FORWARD") {
+    step_forward(1);
+    sendCommandResponse("Executing: FORWARD");
+  } else if (command == "4" || command == "BACKWARD") {
+    step_back(1);
+    sendCommandResponse("Executing: BACKWARD");
+  } else if (command == "5" || command == "LEFT") {
+    turn_left(1);
+    sendCommandResponse("Executing: LEFT");
+  } else if (command == "6" || command == "RIGHT") {
+    turn_right(1);
+    sendCommandResponse("Executing: RIGHT");
+  } else if (command == "7" || command == "SHAKE") {
+    hand_shake(1);
+    sendCommandResponse("Executing: SHAKE");
+  } else if (command == "8" || command == "WAVE") {
+    hand_wave(1);
+    sendCommandResponse("Executing: WAVE");
+  } else if (command == "9" || command == "DANCE") {
+    body_dance(1);
+    sendCommandResponse("Executing: DANCE");
+  } else if (command == "TEST") {
+    do_test();
+    sendCommandResponse("Executing: TEST");
+  } else if (command == "SENSORS") {
+    readSensors();
+    sendSensorDataToClient();
+    sendCommandResponse("Sent sensor data");
+  } else if (command == "AUTO_ON") {
+    autoSendEnabled = true;
+    sendCommandResponse("Auto send enabled");
+  } else if (command == "AUTO_OFF") {
+    autoSendEnabled = false;
+    sendCommandResponse("Auto send disabled");
+  } else {
+    sendCommandResponse("Unknown command: " + command);
+  }
+
 }
 
 void setupSensors() {
@@ -944,6 +1034,26 @@ void set_site(int leg, float x, float y, float z) {
   logMessage(DEBUG, buffer);
 
   polar_to_servo(leg, alpha, beta, gamma);
+}
+
+void wait_reach(int leg) {
+  unsigned long startTime = millis();
+  const unsigned long timeout = 5000; // Таймаут 5 секунд
+
+  while (millis() - startTime < timeout) {
+    if (is_reach_position(leg, site_expect[leg][0], site_expect[leg][1], site_expect[leg][2])) {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "✅ Leg %d reached target position", leg);
+      logMessage(INFO, buffer);
+      return;
+    }
+    delay(50); // Проверка каждые 50 мс
+  }
+
+  // Если таймаут истёк
+  char buffer[64];
+  snprintf(buffer, sizeof(buffer), "⚠️ Leg %d did not reach target position within timeout", leg);
+  logMessage(WARNING, buffer);
 }
 
 void wait_all_reach() {
